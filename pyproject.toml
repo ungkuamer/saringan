@@ -1,0 +1,15 @@
+[project]
+name = "saringan"
+version = "0.1.0"
+description = "Standalone CLI for deterministic validation."
+requires-python = ">=3.12"
+
+[project.scripts]
+saringan = "saringan.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
