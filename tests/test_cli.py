@@ -28,6 +28,7 @@ def assert_check_outcome(
     payload: dict[str, object],
     *,
     expected_id: str,
+    expected_stable_check_id: str,
     expected_status: str,
     expected_stdout: str,
     expected_stderr: str,
@@ -36,6 +37,7 @@ def assert_check_outcome(
     expected_working_directory: str,
 ) -> None:
     assert payload["check_outcomes"][0]["id"] == expected_id
+    assert payload["check_outcomes"][0]["stable_check_id"] == expected_stable_check_id
     assert payload["check_outcomes"][0]["status"] == expected_status
     evidence = payload["check_outcomes"][0]["evidence"]
     assert evidence["stdout"] == expected_stdout
@@ -64,6 +66,7 @@ def test_validate_json_reports_passed_result_for_valid_target(tmp_path: Path) ->
     assert_check_outcome(
         payload,
         expected_id="fixture",
+        expected_stable_check_id="command",
         expected_status="passed",
         expected_stdout="",
         expected_stderr="",
@@ -337,6 +340,7 @@ def test_validate_reports_failed_result_for_failing_command_check(
     assert_check_outcome(
         payload,
         expected_id="fixture",
+        expected_stable_check_id="command",
         expected_status="failed",
         expected_stdout="fail-out",
         expected_stderr="fail-err",
@@ -375,6 +379,11 @@ def test_validate_runs_checks_in_order_and_ignores_advisory_failures(
         "advisory-failure",
         "third",
     ]
+    assert [outcome["stable_check_id"] for outcome in payload["check_outcomes"]] == [
+        "command",
+        "command",
+        "command",
+    ]
     assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
         "passed",
         "failed",
@@ -405,6 +414,10 @@ def test_validate_skips_checks_with_unsatisfied_dependencies(
         "failed",
         "skipped",
     ]
+    assert [outcome["stable_check_id"] for outcome in payload["check_outcomes"]] == [
+        "command",
+        "command",
+    ]
     assert payload["check_outcomes"][1]["reason"] == "unsatisfied dependency"
 
 
@@ -432,6 +445,33 @@ def test_validate_supports_typed_javascript_lint_checks(tmp_path: Path) -> None:
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
+        '[[checks]]\nid = "js-lint"\ntype = "javascript_lint"\n'
+        'command = ["sh", "-c", "printf lint-ok"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="js-lint",
+        expected_stable_check_id="javascript_lint",
+        expected_status="passed",
+        expected_stdout="lint-ok",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf lint-ok"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
+def test_validate_accepts_deprecated_javascript_lint_alias(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
         '[[checks]]\nid = "js-lint"\ntype = "javascript-lint"\n'
         'command = ["sh", "-c", "printf lint-ok"]\n'
     )
@@ -444,6 +484,7 @@ def test_validate_supports_typed_javascript_lint_checks(tmp_path: Path) -> None:
     assert_check_outcome(
         payload,
         expected_id="js-lint",
+        expected_stable_check_id="javascript_lint",
         expected_status="passed",
         expected_stdout="lint-ok",
         expected_stderr="",
@@ -461,13 +502,13 @@ def test_validate_runs_javascript_typed_checks_with_policy_and_dependencies(
     order_file = target / "js-order.txt"
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "js-lint"\ntype = "javascript-lint"\n'
+        '[[checks]]\nid = "js-lint"\ntype = "javascript_lint"\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").write_text(\\"lint\\\\n\\")"]\n\n'
-        '[[checks]]\nid = "js-tests"\ntype = "javascript-tests"\nadvisory = true\n'
+        '[[checks]]\nid = "js-tests"\ntype = "javascript_tests"\nadvisory = true\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"tests\\\\n\\"); raise SystemExit(4)"]\n\n'
-        '[[checks]]\nid = "js-build"\ntype = "javascript-build"\ndepends_on = ["js-lint"]\n'
+        '[[checks]]\nid = "js-build"\ntype = "javascript_build"\ndepends_on = ["js-lint"]\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"build\\\\n\\")"]\n'
     )
@@ -481,6 +522,11 @@ def test_validate_runs_javascript_typed_checks_with_policy_and_dependencies(
         "js-lint",
         "js-tests",
         "js-build",
+    ]
+    assert [outcome["stable_check_id"] for outcome in payload["check_outcomes"]] == [
+        "javascript_lint",
+        "javascript_tests",
+        "javascript_build",
     ]
     assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
         "passed",
@@ -497,7 +543,7 @@ def test_validate_reports_error_for_unknown_fields_on_javascript_typed_checks(
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "js-lint"\ntype = "javascript-lint"\n'
+        '[[checks]]\nid = "js-lint"\ntype = "javascript_lint"\n'
         'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
     )
 
@@ -506,7 +552,7 @@ def test_validate_reports_error_for_unknown_fields_on_javascript_typed_checks(
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
-    assert payload["message"] == "Unknown fields for javascript-lint check: extra_field"
+    assert payload["message"] == "Unknown fields for javascript_lint check: extra_field"
 
 
 def test_validate_reports_error_when_javascript_tool_is_missing(tmp_path: Path) -> None:
@@ -514,7 +560,7 @@ def test_validate_reports_error_when_javascript_tool_is_missing(tmp_path: Path) 
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "js-tests"\ntype = "javascript-tests"\n'
+        '[[checks]]\nid = "js-tests"\ntype = "javascript_tests"\n'
         'command = ["command-that-does-not-exist"]\n'
     )
 
@@ -526,6 +572,7 @@ def test_validate_reports_error_when_javascript_tool_is_missing(tmp_path: Path) 
     assert_check_outcome(
         payload,
         expected_id="js-tests",
+        expected_stable_check_id="javascript_tests",
         expected_status="error",
         expected_stdout="",
         expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
@@ -536,6 +583,33 @@ def test_validate_reports_error_when_javascript_tool_is_missing(tmp_path: Path) 
 
 
 def test_validate_supports_typed_secrets_scan_checks(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets_scan"\n'
+        'command = ["sh", "-c", "printf clean"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="secrets",
+        expected_stable_check_id="secrets_scan",
+        expected_status="passed",
+        expected_stdout="clean",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf clean"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
+def test_validate_accepts_deprecated_secrets_scan_alias(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     (target / "saringan.toml").write_text(
@@ -552,6 +626,7 @@ def test_validate_supports_typed_secrets_scan_checks(tmp_path: Path) -> None:
     assert_check_outcome(
         payload,
         expected_id="secrets",
+        expected_stable_check_id="secrets_scan",
         expected_status="passed",
         expected_stdout="clean",
         expected_stderr="",
@@ -569,13 +644,13 @@ def test_validate_runs_repository_guard_checks_with_policy_and_dependencies(
     order_file = target / "guard-order.txt"
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets_scan"\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").write_text(\\"secrets\\\\n\\")"]\n\n'
-        '[[checks]]\nid = "env-advisory"\ntype = "environment-file-guard"\nadvisory = true\n'
+        '[[checks]]\nid = "env-advisory"\ntype = "environment_file_guard"\nadvisory = true\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"env-advisory\\\\n\\"); raise SystemExit(6)"]\n\n'
-        '[[checks]]\nid = "env-dependent"\ntype = "environment-file-guard"\ndepends_on = ["secrets"]\n'
+        '[[checks]]\nid = "env-dependent"\ntype = "environment_file_guard"\ndepends_on = ["secrets"]\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"env-dependent\\\\n\\")"]\n'
     )
@@ -589,6 +664,11 @@ def test_validate_runs_repository_guard_checks_with_policy_and_dependencies(
         "secrets",
         "env-advisory",
         "env-dependent",
+    ]
+    assert [outcome["stable_check_id"] for outcome in payload["check_outcomes"]] == [
+        "secrets_scan",
+        "environment_file_guard",
+        "environment_file_guard",
     ]
     assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
         "passed",
@@ -605,7 +685,7 @@ def test_validate_reports_error_for_unknown_fields_on_secrets_scan_checks(
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets_scan"\n'
         'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
     )
 
@@ -614,7 +694,7 @@ def test_validate_reports_error_for_unknown_fields_on_secrets_scan_checks(
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
-    assert payload["message"] == "Unknown fields for secrets-scan check: extra_field"
+    assert payload["message"] == "Unknown fields for secrets_scan check: extra_field"
 
 
 def test_validate_reports_error_for_unknown_fields_on_environment_file_guard_checks(
@@ -624,7 +704,7 @@ def test_validate_reports_error_for_unknown_fields_on_environment_file_guard_che
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "env"\ntype = "environment-file-guard"\n'
+        '[[checks]]\nid = "env"\ntype = "environment_file_guard"\n'
         'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
     )
 
@@ -635,7 +715,36 @@ def test_validate_reports_error_for_unknown_fields_on_environment_file_guard_che
     assert payload["status"] == "error"
     assert (
         payload["message"]
-        == "Unknown fields for environment-file-guard check: extra_field"
+        == "Unknown fields for environment_file_guard check: extra_field"
+    )
+
+
+def test_validate_accepts_deprecated_environment_file_guard_alias(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "env"\ntype = "environment-file-guard"\n'
+        'command = ["sh", "-c", "printf ok"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="env",
+        expected_stable_check_id="environment_file_guard",
+        expected_status="passed",
+        expected_stdout="ok",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf ok"],
+        expected_working_directory=str(target.resolve()),
     )
 
 
@@ -646,7 +755,7 @@ def test_validate_reports_error_outcome_when_repository_guard_tool_is_missing(
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "env"\ntype = "environment-file-guard"\n'
+        '[[checks]]\nid = "env"\ntype = "environment_file_guard"\n'
         'command = ["command-that-does-not-exist"]\n'
     )
 
@@ -658,6 +767,7 @@ def test_validate_reports_error_outcome_when_repository_guard_tool_is_missing(
     assert_check_outcome(
         payload,
         expected_id="env",
+        expected_stable_check_id="environment_file_guard",
         expected_status="error",
         expected_stdout="",
         expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
@@ -685,6 +795,7 @@ def test_validate_reports_error_outcome_when_command_cannot_execute(
     assert_check_outcome(
         payload,
         expected_id="fixture",
+        expected_stable_check_id="command",
         expected_status="error",
         expected_stdout="",
         expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
@@ -696,6 +807,33 @@ def test_validate_reports_error_outcome_when_command_cannot_execute(
 
 
 def test_validate_supports_typed_python_lint_checks(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python_lint"\n'
+        'command = ["sh", "-c", "printf lint-ok"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="py-lint",
+        expected_stable_check_id="python_lint",
+        expected_status="passed",
+        expected_stdout="lint-ok",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf lint-ok"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
+def test_validate_accepts_deprecated_python_lint_alias(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     (target / "saringan.toml").write_text(
@@ -712,6 +850,7 @@ def test_validate_supports_typed_python_lint_checks(tmp_path: Path) -> None:
     assert_check_outcome(
         payload,
         expected_id="py-lint",
+        expected_stable_check_id="python_lint",
         expected_status="passed",
         expected_stdout="lint-ok",
         expected_stderr="",
@@ -729,13 +868,13 @@ def test_validate_runs_python_typed_checks_with_policy_and_dependencies(
     order_file = target / "python-order.txt"
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "py-lint"\ntype = "python-lint"\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python_lint"\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").write_text(\\"lint\\\\n\\")"]\n\n'
-        '[[checks]]\nid = "py-tests"\ntype = "python-tests"\nadvisory = true\n'
+        '[[checks]]\nid = "py-tests"\ntype = "python_tests"\nadvisory = true\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"tests\\\\n\\"); raise SystemExit(5)"]\n\n'
-        '[[checks]]\nid = "py-typecheck"\ntype = "python-typecheck"\ndepends_on = ["py-lint"]\n'
+        '[[checks]]\nid = "py-typecheck"\ntype = "python_typecheck"\ndepends_on = ["py-lint"]\n'
         'command = ["python3", "-c", "from pathlib import Path; '
         f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"typecheck\\\\n\\")"]\n'
     )
@@ -749,6 +888,11 @@ def test_validate_runs_python_typed_checks_with_policy_and_dependencies(
         "py-lint",
         "py-tests",
         "py-typecheck",
+    ]
+    assert [outcome["stable_check_id"] for outcome in payload["check_outcomes"]] == [
+        "python_lint",
+        "python_tests",
+        "python_typecheck",
     ]
     assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
         "passed",
@@ -765,7 +909,7 @@ def test_validate_reports_error_for_unknown_fields_on_python_typed_checks(
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "py-lint"\ntype = "python-lint"\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python_lint"\n'
         'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
     )
 
@@ -774,7 +918,7 @@ def test_validate_reports_error_for_unknown_fields_on_python_typed_checks(
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
-    assert payload["message"] == "Unknown fields for python-lint check: extra_field"
+    assert payload["message"] == "Unknown fields for python_lint check: extra_field"
 
 
 def test_validate_reports_error_when_python_tool_is_missing(tmp_path: Path) -> None:
@@ -782,7 +926,7 @@ def test_validate_reports_error_when_python_tool_is_missing(tmp_path: Path) -> N
     target.mkdir()
     (target / "saringan.toml").write_text(
         'schema_version = 1\n\n'
-        '[[checks]]\nid = "py-tests"\ntype = "python-tests"\n'
+        '[[checks]]\nid = "py-tests"\ntype = "python_tests"\n'
         'command = ["command-that-does-not-exist"]\n'
     )
 
@@ -794,6 +938,7 @@ def test_validate_reports_error_when_python_tool_is_missing(tmp_path: Path) -> N
     assert_check_outcome(
         payload,
         expected_id="py-tests",
+        expected_stable_check_id="python_tests",
         expected_status="error",
         expected_stdout="",
         expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
@@ -933,3 +1078,52 @@ def test_validate_fixture_status_rejected_even_when_no_checks_present(
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
     assert "Unknown top-level configuration fields: fixture_status" in payload["message"]
+
+
+def test_validate_deprecated_alias_reports_error_for_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    """Error messages use canonical names even when deprecated alias was used as input."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    # Error message must use canonical name, not the deprecated alias
+    assert payload["message"] == "Unknown fields for secrets_scan check: extra_field"
+
+
+def test_validate_depends_on_uses_user_ids_not_stable_ids(tmp_path: Path) -> None:
+    """Dependency resolution uses user-defined check ids, not stable check IDs."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "base-check"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 8"]\n\n'
+        '[[checks]]\nid = "dependent-check"\ntype = "command"\ndepends_on = ["base-check"]\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    assert [outcome["id"] for outcome in payload["check_outcomes"]] == [
+        "base-check",
+        "dependent-check",
+    ]
+    assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
+        "failed",
+        "skipped",
+    ]
+    assert payload["check_outcomes"][1]["reason"] == "unsatisfied dependency"
