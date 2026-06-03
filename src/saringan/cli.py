@@ -22,6 +22,9 @@ CHECK_FIELDS_BY_TYPE = {
     "javascript-lint": ALLOWED_EXECUTABLE_CHECK_FIELDS,
     "javascript-tests": ALLOWED_EXECUTABLE_CHECK_FIELDS,
     "javascript-build": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "python-lint": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "python-typecheck": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "python-tests": ALLOWED_EXECUTABLE_CHECK_FIELDS,
     "secrets-scan": ALLOWED_EXECUTABLE_CHECK_FIELDS,
     "environment-file-guard": ALLOWED_EXECUTABLE_CHECK_FIELDS,
 }

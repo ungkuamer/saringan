@@ -673,6 +673,114 @@ def test_validate_reports_error_outcome_when_command_cannot_execute(
     assert "No such file or directory" in payload["check_outcomes"][0]["evidence"]["stderr"]
 
 
+def test_validate_supports_typed_python_lint_checks(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python-lint"\n'
+        'command = ["sh", "-c", "printf lint-ok"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="py-lint",
+        expected_status="passed",
+        expected_stdout="lint-ok",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf lint-ok"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
+def test_validate_runs_python_typed_checks_with_policy_and_dependencies(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    order_file = target / "python-order.txt"
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python-lint"\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").write_text(\\"lint\\\\n\\")"]\n\n'
+        '[[checks]]\nid = "py-tests"\ntype = "python-tests"\nadvisory = true\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"tests\\\\n\\"); raise SystemExit(5)"]\n\n'
+        '[[checks]]\nid = "py-typecheck"\ntype = "python-typecheck"\ndepends_on = ["py-lint"]\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"typecheck\\\\n\\")"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert [outcome["id"] for outcome in payload["check_outcomes"]] == [
+        "py-lint",
+        "py-tests",
+        "py-typecheck",
+    ]
+    assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
+        "passed",
+        "failed",
+        "passed",
+    ]
+    assert order_file.read_text() == "lint\ntests\ntypecheck\n"
+
+
+def test_validate_reports_error_for_unknown_fields_on_python_typed_checks(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "py-lint"\ntype = "python-lint"\n'
+        'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Unknown fields for python-lint check: extra_field"
+
+
+def test_validate_reports_error_when_python_tool_is_missing(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "py-tests"\ntype = "python-tests"\n'
+        'command = ["command-that-does-not-exist"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert_check_outcome(
+        payload,
+        expected_id="py-tests",
+        expected_status="error",
+        expected_stdout="",
+        expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
+        expected_exit_code=None,
+        expected_command=["command-that-does-not-exist"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
 def test_validate_bounds_check_evidence_output_and_reports_duration(
     tmp_path: Path,
 ) -> None:
