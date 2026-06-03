@@ -105,7 +105,8 @@ def test_validate_json_reports_failed_result_for_failing_check(tmp_path: Path) -
     assert payload["check_outcomes"][0]["status"] == "failed"
 
 
-def test_validate_default_output_is_human_readable(tmp_path: Path) -> None:
+def test_validate_default_output_is_parseable_json_on_stdout(tmp_path: Path) -> None:
+    """Without --json, stdout is still parseable Validation Result JSON."""
     target = tmp_path / "target"
     target.mkdir()
     (target / "saringan.toml").write_text(
@@ -116,8 +117,11 @@ def test_validate_default_output_is_human_readable(tmp_path: Path) -> None:
     result = run_cli("validate", str(target))
 
     assert result.returncode == 0
-    assert "Validation passed:" in result.stdout
-    assert not result.stdout.lstrip().startswith("{")
+    # stdout must be parseable JSON (the Validation Result).
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    # Human-readable output goes to stderr.
+    assert "Validation passed:" in result.stderr
 
 
 def test_validate_json_writes_machine_output_to_stdout_and_progress_to_stderr(
@@ -933,3 +937,72 @@ def test_validate_fixture_status_rejected_even_when_no_checks_present(
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
     assert "Unknown top-level configuration fields: fixture_status" in payload["message"]
+
+
+def _payload_without_timestamps(payload: dict[str, object]) -> dict[str, object]:
+    """Strip timestamps and duration fields so two invocations can be compared."""
+    clean: dict[str, object] = {
+        k: v
+        for k, v in payload.items()
+        if k not in ("started_at", "finished_at")
+    }
+    if isinstance(clean.get("check_outcomes"), list):
+        clean["check_outcomes"] = [
+            {
+                **{ck: cv for ck, cv in outcome.items() if ck != "evidence"},
+                "evidence": {
+                    ek: ev
+                    for ek, ev in outcome.get("evidence", {}).items()
+                    if ek != "duration_seconds"
+                },
+            }
+            for outcome in clean["check_outcomes"]
+        ]
+    return clean
+
+
+def test_validate_json_flag_is_noop_for_passed_result(tmp_path: Path) -> None:
+    """--json is a deprecated no-op: with/without it produce equivalent output."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
+
+    with_json = run_cli("validate", str(target), "--json")
+    without_json = run_cli("validate", str(target))
+
+    assert with_json.returncode == 0
+    assert without_json.returncode == 0
+    assert _payload_without_timestamps(json.loads(with_json.stdout)) == _payload_without_timestamps(json.loads(without_json.stdout))
+
+
+def test_validate_json_flag_is_noop_for_failed_result(tmp_path: Path) -> None:
+    """--json is a deprecated no-op for failed validations too."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 1"]\n'
+    )
+
+    with_json = run_cli("validate", str(target), "--json")
+    without_json = run_cli("validate", str(target))
+
+    assert with_json.returncode == 1
+    assert without_json.returncode == 1
+    assert _payload_without_timestamps(json.loads(with_json.stdout)) == _payload_without_timestamps(json.loads(without_json.stdout))
+
+
+def test_validate_json_flag_is_noop_for_error_result(tmp_path: Path) -> None:
+    """--json is a deprecated no-op for error outcomes (e.g. missing config)."""
+    target = tmp_path / "target"
+    target.mkdir()
+
+    with_json = run_cli("validate", str(target), "--json")
+    without_json = run_cli("validate", str(target))
+
+    assert with_json.returncode == 2
+    assert without_json.returncode == 2
+    assert _payload_without_timestamps(json.loads(with_json.stdout)) == _payload_without_timestamps(json.loads(without_json.stdout))

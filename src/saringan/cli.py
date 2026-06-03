@@ -374,15 +374,11 @@ def main(argv: list[str] | None = None) -> int:
         log_dir=log_dir,
     )
     payload = json.dumps(asdict(result))
-    progress_line = f"Validating {result.target_path}"
-    if args.json_mode:
-        print(progress_line, file=sys.stderr)
-        if result.message:
-            print(result.message, file=sys.stderr)
-        print(payload)
-    else:
-        print(progress_line)
-        print(f"Validation {result.status}: {result.target_path}")
-        if result.message:
-            print(result.message)
+    # Human-readable and progress output always goes to stderr.
+    print(f"Validating {result.target_path}", file=sys.stderr)
+    print(f"Validation {result.status}: {result.target_path}", file=sys.stderr)
+    if result.message:
+        print(result.message, file=sys.stderr)
+    # Machine-readable Validation Result JSON always goes to stdout.
+    print(payload)
     return exit_code
