@@ -16,7 +16,12 @@ EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
 ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks"}
-SUPPORTED_CHECK_TYPES = {"command"}
+SUPPORTED_CHECK_TYPES = {
+    "command",
+    "javascript-lint",
+    "javascript-tests",
+    "javascript-build",
+}
 ALLOWED_COMMAND_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
 
@@ -66,6 +71,15 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
             unknown_fields = sorted(set(check) - ALLOWED_COMMAND_CHECK_FIELDS)
             if unknown_fields:
                 field_list = ", ".join(unknown_fields)
+                check_type = check.get("type")
+                if check_type in {
+                    "javascript-lint",
+                    "javascript-tests",
+                    "javascript-build",
+                }:
+                    return ConfigError(
+                        message=f"Unknown fields for {check_type} check: {field_list}"
+                    )
                 return ConfigError(
                     message=f"Unknown fields for command check: {field_list}"
                 )
