@@ -102,3 +102,78 @@ def test_validate_reports_error_when_config_file_is_missing(tmp_path: Path) -> N
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
     assert payload["config_path"] == str((target / "saringan.toml").resolve())
+
+
+def test_validate_json_allows_overriding_config_path(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    custom_config = tmp_path / "custom.toml"
+    custom_config.write_text('schema_version = 1\nfixture_status = "passed"\n')
+
+    result = run_cli("validate", str(target), "--config", str(custom_config), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert payload["target_path"] == str(target.resolve())
+    assert payload["config_path"] == str(custom_config.resolve())
+
+
+def test_validate_reports_error_for_invalid_toml_config(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "passed"\n[')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["config_path"] == str((target / "saringan.toml").resolve())
+    assert "Invalid configuration TOML" in payload["message"]
+
+
+def test_validate_reports_error_when_schema_version_is_missing(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('fixture_status = "passed"\n')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["config_path"] == str((target / "saringan.toml").resolve())
+    assert payload["message"] == "Missing required schema_version in configuration."
+
+
+def test_validate_reports_error_when_schema_version_is_unsupported(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('schema_version = 2\nfixture_status = "passed"\n')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Unsupported schema_version: 2"
+
+
+def test_validate_reports_error_for_unknown_top_level_configuration_fields(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\nfixture_status = "passed"\nextra_field = true\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Unknown top-level configuration fields: extra_field"
