@@ -17,7 +17,7 @@ EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
 ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks"}
 SUPPORTED_CHECK_TYPES = {"command"}
-ALLOWED_COMMAND_CHECK_FIELDS = {"id", "type", "command"}
+ALLOWED_COMMAND_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
 
 
@@ -90,6 +90,15 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
                     message=f"Check '{check_id}' command must be an argument vector."
                 )
 
+            depends_on = check.get("depends_on")
+            if depends_on is not None and (
+                not isinstance(depends_on, list)
+                or any(not isinstance(dep, str) or not dep.strip() for dep in depends_on)
+            ):
+                return ConfigError(
+                    message=f"Check '{check_id}' depends_on must be an array of check ids."
+                )
+
     return data
 
 
@@ -136,6 +145,35 @@ def execute_command_check(check: dict[str, object], target_path: Path) -> dict[s
             "command": command,
             "working_directory": str(target_path.resolve()),
         },
+        }
+
+
+def dependency_ids(check: dict[str, object]) -> list[str]:
+    depends_on = check.get("depends_on")
+    if not depends_on:
+        return []
+    return [str(dep) for dep in depends_on]
+
+
+def aggregate_validation_status(check_outcomes: list[dict[str, object]]) -> str:
+    if any(outcome["status"] == "error" for outcome in check_outcomes):
+        return "error"
+
+    for outcome in check_outcomes:
+        if outcome["status"] != "failed":
+            continue
+        if outcome.get("blocking", True):
+            return "failed"
+
+    return "passed"
+
+
+def build_skipped_outcome(check: dict[str, object], reason: str) -> dict[str, object]:
+    return {
+        "id": str(check["id"]),
+        "status": "skipped",
+        "reason": reason,
+        "blocking": not bool(check.get("advisory", False)),
     }
 
 
@@ -192,15 +230,47 @@ def validate_target(
         )
 
     if "checks" in config_data:
-        check_outcomes = [
-            execute_command_check(check, target_path)
-            for check in config_data["checks"]
-        ]
-        status = "passed"
-        if any(outcome["status"] == "error" for outcome in check_outcomes):
-            status = "error"
-        elif any(outcome["status"] == "failed" for outcome in check_outcomes):
-            status = "failed"
+        declared_checks = {str(check["id"]): check for check in config_data["checks"]}
+        check_outcomes = []
+        for check in config_data["checks"]:
+            missing_dependency = next(
+                (
+                    dependency_id
+                    for dependency_id in dependency_ids(check)
+                    if dependency_id not in declared_checks
+                ),
+                None,
+            )
+            if missing_dependency is not None:
+                finished_at = iso_now()
+                return (
+                    ValidationResult(
+                        status="error",
+                        target_path=resolved_target_path,
+                        config_path=str(resolved_config_path.resolve()),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        message=(
+                            f"Check '{check['id']}' depends on unknown check id: {missing_dependency}"
+                        ),
+                    ),
+                    EXIT_ERROR,
+                )
+
+        outcome_by_id: dict[str, dict[str, object]] = {}
+        for check in config_data["checks"]:
+            dependency_outcomes = [outcome_by_id[dep] for dep in dependency_ids(check)]
+            if any(outcome["status"] != "passed" for outcome in dependency_outcomes):
+                outcome = build_skipped_outcome(check, "unsatisfied dependency")
+                outcome_by_id[str(check["id"])] = outcome
+                check_outcomes.append(outcome)
+                continue
+
+            outcome = execute_command_check(check, target_path)
+            outcome["blocking"] = not bool(check.get("advisory", False))
+            outcome_by_id[str(check["id"])] = outcome
+            check_outcomes.append(outcome)
+        status = aggregate_validation_status(check_outcomes)
     else:
         status = str(config_data.get("fixture_status", "passed"))
         check_outcomes = [{"id": "fixture", "status": status}]

@@ -324,6 +324,87 @@ def test_validate_reports_failed_result_for_failing_command_check(
     )
 
 
+def test_validate_runs_checks_in_order_and_ignores_advisory_failures(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    order_file = target / "order.txt"
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "first"\ntype = "command"\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").write_text(\\"first\\\\n\\")"]\n\n'
+        '[[checks]]\nid = "advisory-failure"\ntype = "command"\nadvisory = true\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"second\\\\n\\"); raise SystemExit(7)"]\n\n'
+        '[[checks]]\nid = "third"\ntype = "command"\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"third\\\\n\\")"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert [outcome["id"] for outcome in payload["check_outcomes"]] == [
+        "first",
+        "advisory-failure",
+        "third",
+    ]
+    assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
+        "passed",
+        "failed",
+        "passed",
+    ]
+    assert order_file.read_text() == "first\nsecond\nthird\n"
+
+
+def test_validate_skips_checks_with_unsatisfied_dependencies(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "base"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 8"]\n\n'
+        '[[checks]]\nid = "dependent"\ntype = "command"\ndepends_on = ["base"]\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
+        "failed",
+        "skipped",
+    ]
+    assert payload["check_outcomes"][1]["reason"] == "unsatisfied dependency"
+
+
+def test_validate_reports_error_for_unknown_dependency_check_id(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "dependent"\ntype = "command"\ndepends_on = ["missing"]\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Check 'dependent' depends on unknown check id: missing"
+
+
 def test_validate_reports_error_outcome_when_command_cannot_execute(
     tmp_path: Path,
 ) -> None:
