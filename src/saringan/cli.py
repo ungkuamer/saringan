@@ -15,7 +15,7 @@ EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
-ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks", "log_dir"}
+ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "checks", "log_dir"}
 ALLOWED_EXECUTABLE_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
 CHECK_FIELDS_BY_TYPE = {
     "command": ALLOWED_EXECUTABLE_CHECK_FIELDS,
@@ -269,54 +269,65 @@ def validate_target(
             EXIT_ERROR,
         )
 
-    if "checks" in config_data:
-        configured_log_dir = config_data.get("log_dir")
-        if log_dir is None and isinstance(configured_log_dir, str) and configured_log_dir.strip():
-            log_dir = target_path / configured_log_dir
-        declared_checks = {str(check["id"]): check for check in config_data["checks"]}
-        check_outcomes = []
-        for check in config_data["checks"]:
-            missing_dependency = next(
-                (
-                    dependency_id
-                    for dependency_id in dependency_ids(check)
-                    if dependency_id not in declared_checks
-                ),
-                None,
-            )
-            if missing_dependency is not None:
-                finished_at = iso_now()
-                return (
-                    ValidationResult(
-                        status="error",
-                        target_path=resolved_target_path,
-                        config_path=str(resolved_config_path.resolve()),
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        message=(
-                            f"Check '{check['id']}' depends on unknown check id: {missing_dependency}"
-                        ),
+    declared_checks_list = config_data.get("checks")
+    if not declared_checks_list:
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="error",
+                target_path=resolved_target_path,
+                config_path=str(resolved_config_path.resolve()),
+                started_at=started_at,
+                finished_at=finished_at,
+                message="Configuration does not declare any checks. A saringan.toml must declare at least one [[checks]] entry.",
+            ),
+            EXIT_ERROR,
+        )
+
+    configured_log_dir = config_data.get("log_dir")
+    if log_dir is None and isinstance(configured_log_dir, str) and configured_log_dir.strip():
+        log_dir = target_path / configured_log_dir
+    declared_checks = {str(check["id"]): check for check in config_data["checks"]}
+    check_outcomes = []
+    for check in config_data["checks"]:
+        missing_dependency = next(
+            (
+                dependency_id
+                for dependency_id in dependency_ids(check)
+                if dependency_id not in declared_checks
+            ),
+            None,
+        )
+        if missing_dependency is not None:
+            finished_at = iso_now()
+            return (
+                ValidationResult(
+                    status="error",
+                    target_path=resolved_target_path,
+                    config_path=str(resolved_config_path.resolve()),
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    message=(
+                        f"Check '{check['id']}' depends on unknown check id: {missing_dependency}"
                     ),
-                    EXIT_ERROR,
-                )
+                ),
+                EXIT_ERROR,
+            )
 
-        outcome_by_id: dict[str, dict[str, object]] = {}
-        for check in config_data["checks"]:
-            dependency_outcomes = [outcome_by_id[dep] for dep in dependency_ids(check)]
-            if any(outcome["status"] != "passed" for outcome in dependency_outcomes):
-                outcome = build_skipped_outcome(check, "unsatisfied dependency")
-                outcome_by_id[str(check["id"])] = outcome
-                check_outcomes.append(outcome)
-                continue
-
-            outcome = execute_command_check(check, target_path, log_dir=log_dir)
-            outcome["blocking"] = not bool(check.get("advisory", False))
+    outcome_by_id: dict[str, dict[str, object]] = {}
+    for check in config_data["checks"]:
+        dependency_outcomes = [outcome_by_id[dep] for dep in dependency_ids(check)]
+        if any(outcome["status"] != "passed" for outcome in dependency_outcomes):
+            outcome = build_skipped_outcome(check, "unsatisfied dependency")
             outcome_by_id[str(check["id"])] = outcome
             check_outcomes.append(outcome)
-        status = aggregate_validation_status(check_outcomes)
-    else:
-        status = str(config_data.get("fixture_status", "passed"))
-        check_outcomes = [{"id": "fixture", "status": status}]
+            continue
+
+        outcome = execute_command_check(check, target_path, log_dir=log_dir)
+        outcome["blocking"] = not bool(check.get("advisory", False))
+        outcome_by_id[str(check["id"])] = outcome
+        check_outcomes.append(outcome)
+    status = aggregate_validation_status(check_outcomes)
 
     finished_at = iso_now()
     result = ValidationResult(
