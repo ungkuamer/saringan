@@ -25,7 +25,7 @@ The handoff state used when Saringan failures cannot be resolved automatically. 
 _Avoid_: checks-failed label, custom failure label
 
 **Saringan Invocation**:
-The command-line contract for running Saringan as a standalone tool. It produces stable exit codes for callers and machine-readable results alongside human-readable terminal output.
+The command-line contract for running Saringan as a standalone tool. It produces stable exit codes, machine-readable results on stdout, and human-readable terminal output on stderr.
 _Avoid_: Log scraping, ad hoc script call
 
 **Saringan CLI**:
@@ -84,13 +84,25 @@ _Avoid_: Saringan-managed dependencies, bundled toolchain
 The standard vocabulary of validation checks that Saringan understands across target projects.
 _Avoid_: Hard-coded script steps, project commands
 
+**Stable Check ID**:
+The canonical identifier for a Typed Check within the Check Catalog. Stable Check IDs are snake_case names such as `secrets_scan` and are the identifiers used for dependencies, configuration, and results.
+_Avoid_: Hyphenated check id, display label, ad hoc step name
+
+**Deprecated Check Alias**:
+A non-canonical check name accepted only as temporary configuration input. Deprecated Check Aliases are normalized to Stable Check IDs before dependency resolution and result reporting.
+_Avoid_: Alternate stable id, result id alias, permanent synonym
+
 **Typed Check**:
-A declared Saringan check whose behavior is identified by a check type from the Check Catalog and configured through type-specific fields.
+A declared Saringan check whose behavior is identified by a Stable Check ID from the Check Catalog and configured through type-specific fields. Built-in Typed Checks are the primary Saringan model; generic command checks are escape hatches for target-specific validation.
 _Avoid_: Generic named command, untyped step
 
 **Argument Vector Command**:
 A command declared as an ordered array of executable and arguments rather than a shell-interpreted string.
 _Avoid_: Shell string, inline shell pipeline
+
+**Declared Check Command**:
+The Argument Vector Command supplied by the target repository for a Typed Check. Saringan standardizes the check's meaning, while the target repository declares the exact tool invocation.
+_Avoid_: Inferred command, default command, toolchain guess
 
 **Target Configuration**:
 The target project's declaration of which Saringan checks run, how they run, and whether each check is blocking or advisory. It lives in the repository being validated.
@@ -107,3 +119,7 @@ _Avoid_: Imperative-only setup, free-form shell as configuration
 **Explicit Configuration**:
 The rule that Saringan runs only from declared `saringan.toml` configuration and does not infer validation behavior from repository heuristics.
 _Avoid_: Auto-discovery, guess-based validation
+
+**Declared Check Set**:
+The set of Typed Checks explicitly declared in `saringan.toml` for a Target Repository State. Validation Results must be derived from executing or skipping this declared set, not from fixture-only status fields.
+_Avoid_: Fixture-only result, synthetic pass/fail, undeclared check
