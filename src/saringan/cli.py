@@ -15,7 +15,7 @@ EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
-ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks"}
+ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks", "log_dir"}
 ALLOWED_EXECUTABLE_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
 CHECK_FIELDS_BY_TYPE = {
     "command": ALLOWED_EXECUTABLE_CHECK_FIELDS,
@@ -116,8 +116,28 @@ def bound_output(output: str) -> str:
     return output[:MAX_EVIDENCE_OUTPUT_LENGTH]
 
 
-def execute_command_check(check: dict[str, object], target_path: Path) -> dict[str, object]:
+def persist_check_log(
+    log_dir: Path | None,
+    check_id: str,
+    stdout: str,
+    stderr: str,
+) -> str | None:
+    if log_dir is None:
+        return None
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{check_id}.log"
+    log_path.write_text(stdout + stderr)
+    return str(log_path.resolve())
+
+
+def execute_command_check(
+    check: dict[str, object],
+    target_path: Path,
+    log_dir: Path | None = None,
+) -> dict[str, object]:
     command = list(check["command"])
+    check_id = str(check["id"])
     started_at = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -129,33 +149,42 @@ def execute_command_check(check: dict[str, object], target_path: Path) -> dict[s
         )
     except OSError as error:
         duration_seconds = time.perf_counter() - started_at
+        stderr = str(error)
+        log_path = persist_check_log(log_dir, check_id, "", stderr)
+        evidence = {
+            "stdout": "",
+            "stderr": bound_output(stderr),
+            "exit_code": None,
+            "duration_seconds": duration_seconds,
+            "command": command,
+            "working_directory": str(target_path.resolve()),
+        }
+        if log_path is not None:
+            evidence["log_path"] = log_path
         return {
-            "id": str(check["id"]),
+            "id": check_id,
             "status": "error",
-            "evidence": {
-                "stdout": "",
-                "stderr": bound_output(str(error)),
-                "exit_code": None,
-                "duration_seconds": duration_seconds,
-                "command": command,
-                "working_directory": str(target_path.resolve()),
-            },
+            "evidence": evidence,
         }
 
     duration_seconds = time.perf_counter() - started_at
     status = "passed" if completed.returncode == 0 else "failed"
+    log_path = persist_check_log(log_dir, check_id, completed.stdout, completed.stderr)
+    evidence = {
+        "stdout": bound_output(completed.stdout),
+        "stderr": bound_output(completed.stderr),
+        "exit_code": completed.returncode,
+        "duration_seconds": duration_seconds,
+        "command": command,
+        "working_directory": str(target_path.resolve()),
+    }
+    if log_path is not None:
+        evidence["log_path"] = log_path
     return {
-        "id": str(check["id"]),
+        "id": check_id,
         "status": status,
-        "evidence": {
-            "stdout": bound_output(completed.stdout),
-            "stderr": bound_output(completed.stderr),
-            "exit_code": completed.returncode,
-            "duration_seconds": duration_seconds,
-            "command": command,
-            "working_directory": str(target_path.resolve()),
-        },
-        }
+        "evidence": evidence,
+    }
 
 
 def dependency_ids(check: dict[str, object]) -> list[str]:
@@ -190,6 +219,7 @@ def build_skipped_outcome(check: dict[str, object], reason: str) -> dict[str, ob
 def validate_target(
     target_path: Path,
     config_path: Path | None = None,
+    log_dir: Path | None = None,
 ) -> tuple[ValidationResult, int]:
     started_at = iso_now()
     resolved_config_path = config_path if config_path is not None else target_path / "saringan.toml"
@@ -240,6 +270,9 @@ def validate_target(
         )
 
     if "checks" in config_data:
+        configured_log_dir = config_data.get("log_dir")
+        if log_dir is None and isinstance(configured_log_dir, str) and configured_log_dir.strip():
+            log_dir = target_path / configured_log_dir
         declared_checks = {str(check["id"]): check for check in config_data["checks"]}
         check_outcomes = []
         for check in config_data["checks"]:
@@ -276,7 +309,7 @@ def validate_target(
                 check_outcomes.append(outcome)
                 continue
 
-            outcome = execute_command_check(check, target_path)
+            outcome = execute_command_check(check, target_path, log_dir=log_dir)
             outcome["blocking"] = not bool(check.get("advisory", False))
             outcome_by_id[str(check["id"])] = outcome
             check_outcomes.append(outcome)
@@ -310,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("target_path")
     validate_parser.add_argument("--config", dest="config_path")
+    validate_parser.add_argument("--log-dir", dest="log_dir")
     validate_parser.add_argument("--json", action="store_true", dest="json_mode")
     return parser
 
@@ -322,7 +356,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("unknown command")
 
     config_path = Path(args.config_path) if args.config_path else None
-    result, exit_code = validate_target(Path(args.target_path), config_path=config_path)
+    log_dir = Path(args.log_dir) if args.log_dir else None
+    result, exit_code = validate_target(
+        Path(args.target_path),
+        config_path=config_path,
+        log_dir=log_dir,
+    )
     payload = json.dumps(asdict(result))
     progress_line = f"Validating {result.target_path}"
     if args.json_mode:

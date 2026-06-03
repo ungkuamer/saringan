@@ -802,3 +802,50 @@ def test_validate_bounds_check_evidence_output_and_reports_duration(
     assert evidence["stdout"] == large_stdout[:2000]
     assert evidence["stderr"] == large_stderr[:2000]
     assert evidence["duration_seconds"] >= 0
+
+
+def test_validate_can_persist_full_check_logs_via_cli_flag(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    log_dir = tmp_path / "logs"
+    large_stdout = "x" * 5000
+    large_stderr = "y" * 5000
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "fixture"\ntype = "command"\n'
+        f'command = ["python3", "-c", "import sys; print(\\"{large_stdout}\\", end=\'\'); '
+        f'sys.stderr.write(\\"{large_stderr}\\")"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--log-dir", str(log_dir), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["stdout"] == large_stdout[:2000]
+    assert evidence["stderr"] == large_stderr[:2000]
+    assert evidence["log_path"] == str((log_dir / "fixture.log").resolve())
+    assert Path(evidence["log_path"]).read_text() == large_stdout + large_stderr
+
+
+def test_validate_can_persist_full_check_logs_via_configuration(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    large_stdout = "x" * 5000
+    large_stderr = "y" * 5000
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\nlog_dir = ".saringan/logs"\n\n'
+        '[[checks]]\nid = "fixture"\ntype = "command"\n'
+        f'command = ["python3", "-c", "import sys; print(\\"{large_stdout}\\", end=\'\'); '
+        f'sys.stderr.write(\\"{large_stderr}\\"); raise SystemExit(7)"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["stdout"] == large_stdout[:2000]
+    assert evidence["stderr"] == large_stderr[:2000]
+    assert evidence["log_path"] == str((target / ".saringan" / "logs" / "fixture.log").resolve())
+    assert Path(evidence["log_path"]).read_text() == large_stdout + large_stderr
