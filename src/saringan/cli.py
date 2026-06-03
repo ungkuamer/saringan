@@ -16,13 +16,16 @@ EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
 ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks"}
-SUPPORTED_CHECK_TYPES = {
-    "command",
-    "javascript-lint",
-    "javascript-tests",
-    "javascript-build",
+ALLOWED_EXECUTABLE_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
+CHECK_FIELDS_BY_TYPE = {
+    "command": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "javascript-lint": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "javascript-tests": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "javascript-build": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "secrets-scan": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+    "environment-file-guard": ALLOWED_EXECUTABLE_CHECK_FIELDS,
 }
-ALLOWED_COMMAND_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
+SUPPORTED_CHECK_TYPES = set(CHECK_FIELDS_BY_TYPE)
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
 
 
@@ -68,22 +71,6 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
     if checks is not None:
         seen_check_ids: set[str] = set()
         for check in checks:
-            unknown_fields = sorted(set(check) - ALLOWED_COMMAND_CHECK_FIELDS)
-            if unknown_fields:
-                field_list = ", ".join(unknown_fields)
-                check_type = check.get("type")
-                if check_type in {
-                    "javascript-lint",
-                    "javascript-tests",
-                    "javascript-build",
-                }:
-                    return ConfigError(
-                        message=f"Unknown fields for {check_type} check: {field_list}"
-                    )
-                return ConfigError(
-                    message=f"Unknown fields for command check: {field_list}"
-                )
-
             check_id = check.get("id")
             if not isinstance(check_id, str) or not check_id.strip():
                 return ConfigError(message="Check is missing required id.")
@@ -95,6 +82,12 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
             check_type = check.get("type")
             if check_type not in SUPPORTED_CHECK_TYPES:
                 return ConfigError(message=f"Unsupported check type: {check_type}")
+
+            unknown_fields = sorted(set(check) - CHECK_FIELDS_BY_TYPE[check_type])
+            if unknown_fields:
+                field_list = ", ".join(unknown_fields)
+                label = "command" if check_type == "command" else check_type
+                return ConfigError(message=f"Unknown fields for {label} check: {field_list}")
 
             command = check.get("command")
             if not isinstance(command, list) or any(

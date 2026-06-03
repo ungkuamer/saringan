@@ -513,6 +513,138 @@ def test_validate_reports_error_when_javascript_tool_is_missing(tmp_path: Path) 
     )
 
 
+def test_validate_supports_typed_secrets_scan_checks(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        'command = ["sh", "-c", "printf clean"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert_check_outcome(
+        payload,
+        expected_id="secrets",
+        expected_status="passed",
+        expected_stdout="clean",
+        expected_stderr="",
+        expected_exit_code=0,
+        expected_command=["sh", "-c", "printf clean"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
+def test_validate_runs_repository_guard_checks_with_policy_and_dependencies(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    order_file = target / "guard-order.txt"
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").write_text(\\"secrets\\\\n\\")"]\n\n'
+        '[[checks]]\nid = "env-advisory"\ntype = "environment-file-guard"\nadvisory = true\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"env-advisory\\\\n\\"); raise SystemExit(6)"]\n\n'
+        '[[checks]]\nid = "env-dependent"\ntype = "environment-file-guard"\ndepends_on = ["secrets"]\n'
+        'command = ["python3", "-c", "from pathlib import Path; '
+        f'Path(\\"{order_file.name}\\").open(\\"a\\").write(\\"env-dependent\\\\n\\")"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert [outcome["id"] for outcome in payload["check_outcomes"]] == [
+        "secrets",
+        "env-advisory",
+        "env-dependent",
+    ]
+    assert [outcome["status"] for outcome in payload["check_outcomes"]] == [
+        "passed",
+        "failed",
+        "passed",
+    ]
+    assert order_file.read_text() == "secrets\nenv-advisory\nenv-dependent\n"
+
+
+def test_validate_reports_error_for_unknown_fields_on_secrets_scan_checks(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "secrets"\ntype = "secrets-scan"\n'
+        'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Unknown fields for secrets-scan check: extra_field"
+
+
+def test_validate_reports_error_for_unknown_fields_on_environment_file_guard_checks(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "env"\ntype = "environment-file-guard"\n'
+        'command = ["sh", "-c", "exit 0"]\nextra_field = true\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert (
+        payload["message"]
+        == "Unknown fields for environment-file-guard check: extra_field"
+    )
+
+
+def test_validate_reports_error_outcome_when_repository_guard_tool_is_missing(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n'
+        '[[checks]]\nid = "env"\ntype = "environment-file-guard"\n'
+        'command = ["command-that-does-not-exist"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert_check_outcome(
+        payload,
+        expected_id="env",
+        expected_status="error",
+        expected_stdout="",
+        expected_stderr=payload["check_outcomes"][0]["evidence"]["stderr"],
+        expected_exit_code=None,
+        expected_command=["command-that-does-not-exist"],
+        expected_working_directory=str(target.resolve()),
+    )
+
+
 def test_validate_reports_error_outcome_when_command_cannot_execute(
     tmp_path: Path,
 ) -> None:
