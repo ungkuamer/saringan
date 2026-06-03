@@ -88,22 +88,30 @@ def test_validate_json_reports_error_for_missing_target_path(tmp_path: Path) -> 
     assert result.stderr
 
 
-def test_validate_json_reports_failed_result_for_failed_fixture(tmp_path: Path) -> None:
+def test_validate_json_reports_failed_result_for_failing_check(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "failed"\n')
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 1"]\n'
+    )
 
     result = run_cli("validate", str(target), "--json")
 
     assert result.returncode == 1
     payload = json.loads(result.stdout)
     assert payload["status"] == "failed"
+    assert payload["check_outcomes"][0]["id"] == "smoke"
+    assert payload["check_outcomes"][0]["status"] == "failed"
 
 
 def test_validate_default_output_is_human_readable(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "passed"\n')
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
 
     result = run_cli("validate", str(target))
 
@@ -117,7 +125,10 @@ def test_validate_json_writes_machine_output_to_stdout_and_progress_to_stderr(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "passed"\n')
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
 
     result = run_cli("validate", str(target), "--json")
 
@@ -142,7 +153,10 @@ def test_validate_json_allows_overriding_config_path(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     custom_config = tmp_path / "custom.toml"
-    custom_config.write_text('schema_version = 1\nfixture_status = "passed"\n')
+    custom_config.write_text(
+        'schema_version = 1\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
 
     result = run_cli("validate", str(target), "--config", str(custom_config), "--json")
 
@@ -156,7 +170,7 @@ def test_validate_json_allows_overriding_config_path(tmp_path: Path) -> None:
 def test_validate_reports_error_for_invalid_toml_config(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "passed"\n[')
+    (target / "saringan.toml").write_text('schema_version = 1\n\n[[checks]]\n[')
 
     result = run_cli("validate", str(target), "--json")
 
@@ -170,7 +184,10 @@ def test_validate_reports_error_for_invalid_toml_config(tmp_path: Path) -> None:
 def test_validate_reports_error_when_schema_version_is_missing(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('fixture_status = "passed"\n')
+    (target / "saringan.toml").write_text(
+        '[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
 
     result = run_cli("validate", str(target), "--json")
 
@@ -186,7 +203,10 @@ def test_validate_reports_error_when_schema_version_is_unsupported(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    (target / "saringan.toml").write_text('schema_version = 2\nfixture_status = "passed"\n')
+    (target / "saringan.toml").write_text(
+        'schema_version = 2\n\n[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
 
     result = run_cli("validate", str(target), "--json")
 
@@ -202,7 +222,9 @@ def test_validate_reports_error_for_unknown_top_level_configuration_fields(
     target = tmp_path / "target"
     target.mkdir()
     (target / "saringan.toml").write_text(
-        'schema_version = 1\nfixture_status = "passed"\nextra_field = true\n'
+        'schema_version = 1\nextra_field = true\n\n'
+        '[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
     )
 
     result = run_cli("validate", str(target), "--json")
@@ -849,3 +871,65 @@ def test_validate_can_persist_full_check_logs_via_configuration(tmp_path: Path) 
     assert evidence["stderr"] == large_stderr[:2000]
     assert evidence["log_path"] == str((target / ".saringan" / "logs" / "fixture.log").resolve())
     assert Path(evidence["log_path"]).read_text() == large_stdout + large_stderr
+
+
+def test_validate_rejects_fixture_status_field(tmp_path: Path) -> None:
+    """fixture_status is no longer an allowed top-level field."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('schema_version = 1\nfixture_status = "passed"\n')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "Unknown top-level configuration fields: fixture_status" in payload["message"]
+
+
+def test_validate_reports_error_when_no_checks_declared(tmp_path: Path) -> None:
+    """A config with schema_version but no checks is an error."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('schema_version = 1\n')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "Configuration does not declare any checks" in payload["message"]
+
+
+def test_validate_returns_error_for_empty_checks_list(tmp_path: Path) -> None:
+    """An empty checks table is treated as missing checks."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text('schema_version = 1\nchecks = []\n')
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "Configuration does not declare any checks" in payload["message"]
+
+
+def test_validate_fixture_status_rejected_even_when_no_checks_present(
+    tmp_path: Path,
+) -> None:
+    """fixture_status is rejected at config load time, before checks validation."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "saringan.toml").write_text(
+        'schema_version = 1\nfixture_status = "passed"\n'
+        '[[checks]]\nid = "smoke"\ntype = "command"\n'
+        'command = ["sh", "-c", "exit 0"]\n'
+    )
+
+    result = run_cli("validate", str(target), "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "Unknown top-level configuration fields: fixture_status" in payload["message"]
