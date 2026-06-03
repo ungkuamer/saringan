@@ -5,7 +5,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
 import sys
+import time
 import tomllib
 
 
@@ -13,7 +15,10 @@ EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
-ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status"}
+ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks"}
+SUPPORTED_CHECK_TYPES = {"command"}
+ALLOWED_COMMAND_CHECK_FIELDS = {"id", "type", "command"}
+MAX_EVIDENCE_OUTPUT_LENGTH = 2000
 
 
 @dataclass
@@ -54,7 +59,84 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         return ConfigError(message=f"Unsupported schema_version: {schema_version}")
 
+    checks = data.get("checks")
+    if checks is not None:
+        seen_check_ids: set[str] = set()
+        for check in checks:
+            unknown_fields = sorted(set(check) - ALLOWED_COMMAND_CHECK_FIELDS)
+            if unknown_fields:
+                field_list = ", ".join(unknown_fields)
+                return ConfigError(
+                    message=f"Unknown fields for command check: {field_list}"
+                )
+
+            check_id = check.get("id")
+            if not isinstance(check_id, str) or not check_id.strip():
+                return ConfigError(message="Check is missing required id.")
+
+            if check_id in seen_check_ids:
+                return ConfigError(message=f"Duplicate check id: {check_id}")
+            seen_check_ids.add(check_id)
+
+            check_type = check.get("type")
+            if check_type not in SUPPORTED_CHECK_TYPES:
+                return ConfigError(message=f"Unsupported check type: {check_type}")
+
+            command = check.get("command")
+            if not isinstance(command, list) or any(
+                not isinstance(part, str) for part in command
+            ):
+                return ConfigError(
+                    message=f"Check '{check_id}' command must be an argument vector."
+                )
+
     return data
+
+
+def bound_output(output: str) -> str:
+    return output[:MAX_EVIDENCE_OUTPUT_LENGTH]
+
+
+def execute_command_check(check: dict[str, object], target_path: Path) -> dict[str, object]:
+    command = list(check["command"])
+    started_at = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=target_path,
+            check=False,
+        )
+    except OSError as error:
+        duration_seconds = time.perf_counter() - started_at
+        return {
+            "id": str(check["id"]),
+            "status": "error",
+            "evidence": {
+                "stdout": "",
+                "stderr": bound_output(str(error)),
+                "exit_code": None,
+                "duration_seconds": duration_seconds,
+                "command": command,
+                "working_directory": str(target_path.resolve()),
+            },
+        }
+
+    duration_seconds = time.perf_counter() - started_at
+    status = "passed" if completed.returncode == 0 else "failed"
+    return {
+        "id": str(check["id"]),
+        "status": status,
+        "evidence": {
+            "stdout": bound_output(completed.stdout),
+            "stderr": bound_output(completed.stderr),
+            "exit_code": completed.returncode,
+            "duration_seconds": duration_seconds,
+            "command": command,
+            "working_directory": str(target_path.resolve()),
+        },
+    }
 
 
 def validate_target(
@@ -109,17 +191,35 @@ def validate_target(
             EXIT_ERROR,
         )
 
-    status = str(config_data.get("fixture_status", "passed"))
+    if "checks" in config_data:
+        check_outcomes = [
+            execute_command_check(check, target_path)
+            for check in config_data["checks"]
+        ]
+        status = "passed"
+        if any(outcome["status"] == "error" for outcome in check_outcomes):
+            status = "error"
+        elif any(outcome["status"] == "failed" for outcome in check_outcomes):
+            status = "failed"
+    else:
+        status = str(config_data.get("fixture_status", "passed"))
+        check_outcomes = [{"id": "fixture", "status": status}]
+
     finished_at = iso_now()
     result = ValidationResult(
         status=status,
-        check_outcomes=[{"id": "fixture", "status": status}],
+        check_outcomes=check_outcomes,
         target_path=resolved_target_path,
         config_path=str(resolved_config_path.resolve()),
         started_at=started_at,
         finished_at=finished_at,
     )
-    exit_code = EXIT_PASSED if status == "passed" else EXIT_FAILED
+    if status == "passed":
+        exit_code = EXIT_PASSED
+    elif status == "failed":
+        exit_code = EXIT_FAILED
+    else:
+        exit_code = EXIT_ERROR
     return result, exit_code
 
 
