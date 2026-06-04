@@ -163,7 +163,7 @@ Invoke Saringan against a target repository directory path:
 saringan validate <target_path> [options]
 ```
 
-For the advisory Contextual Judge Gate skeleton:
+For the advisory Contextual Judge Gate preflight:
 
 ```bash
 saringan judge <target_path> --diff <diff_path> --issue <issue_path> [options]
@@ -176,8 +176,10 @@ saringan judge <target_path> --diff <diff_path> --issue <issue_path> [options]
 *   `--json`: Deprecated compatibility flag. Validation Result JSON is always written to stdout.
 *   `judge --diff <diff_path>`: Required path to the diff artifact for Contextual Judge Gate input.
 *   `judge --issue <issue_path>`: Required path to the issue/context artifact for Contextual Judge Gate input.
-*   `judge --conventions <conventions_path>`: Optional project conventions artifact.
+*   `judge --conventions <conventions_path>`: Optional project conventions artifact. If provided, the file must exist.
 *   `judge --model <model>`: Required model identifier to record in the advisory result payload.
+
+The current `judge` command performs deterministic preflight only. It reads the diff and issue artifacts, optionally reads conventions, extracts changed files from standard `diff --git` headers, detects obvious added debug artifacts such as `print(...)` and `console.log(...)`, and returns bounded advisory evidence in the JSON payload before any LLM provider is involved.
 
 ### Output Contract (stdout / stderr)
 

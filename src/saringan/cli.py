@@ -44,6 +44,7 @@ DEPRECATED_TYPE_ALIASES: dict[str, str] = {
 CHECK_FIELDS_BY_TYPE = {check_id: ALLOWED_EXECUTABLE_CHECK_FIELDS for check_id in STABLE_CHECK_IDS}
 SUPPORTED_CHECK_TYPES = set(CHECK_FIELDS_BY_TYPE) | set(DEPRECATED_TYPE_ALIASES)
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
+DEBUG_ARTIFACT_PATTERNS = ("print(", "console.log(")
 
 
 @dataclass
@@ -69,6 +70,13 @@ class JudgeRequest:
     issue_path: Path
     conventions_path: Path | None
     model: str
+
+
+@dataclass
+class JudgeInput:
+    diff_text: str
+    issue_text: str
+    conventions_text: str | None
 
 
 def iso_now() -> str:
@@ -140,6 +148,64 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
 
 def bound_output(output: str) -> str:
     return output[:MAX_EVIDENCE_OUTPUT_LENGTH]
+
+
+def read_judge_input(request: JudgeRequest) -> JudgeInput:
+    return JudgeInput(
+        diff_text=request.diff_path.read_text(),
+        issue_text=request.issue_path.read_text(),
+        conventions_text=(
+            request.conventions_path.read_text()
+            if request.conventions_path is not None
+            else None
+        ),
+    )
+
+
+def extract_changed_files(diff_text: str) -> list[str]:
+    changed_files: list[str] = []
+    for line in diff_text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        candidate = parts[3]
+        if candidate.startswith("b/"):
+            candidate = candidate[2:]
+        if candidate not in changed_files:
+            changed_files.append(candidate)
+    return changed_files
+
+
+def detect_debug_artifacts(diff_text: str) -> list[dict[str, object]]:
+    advisories: list[dict[str, object]] = []
+    current_file: str | None = None
+    added_line_number = 0
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            current_file = None
+            added_line_number = 0
+            if len(parts) >= 4:
+                current_file = parts[3][2:] if parts[3].startswith("b/") else parts[3]
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+
+        added_line_number += 1
+        snippet = line[1:]
+        if not any(pattern in snippet for pattern in DEBUG_ARTIFACT_PATTERNS):
+            continue
+        advisories.append(
+            {
+                "kind": "debug_artifact",
+                "file": current_file,
+                "line": added_line_number,
+                "snippet": bound_output(snippet),
+            }
+        )
+    return advisories
 
 
 def persist_check_log(
@@ -383,8 +449,36 @@ def validate_target(
 
 def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
     started_at = iso_now()
-    finished_at = iso_now()
     resolved_target_path = str(request.target_path.resolve())
+    required_paths = [
+        request.target_path,
+        request.diff_path,
+        request.issue_path,
+        request.conventions_path,
+    ]
+
+    missing_path = next(
+        (path for path in required_paths if path is not None and not path.exists()),
+        None,
+    )
+    if missing_path is not None:
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="error",
+                target_path=resolved_target_path,
+                config_path=None,
+                started_at=started_at,
+                finished_at=finished_at,
+                message=f"Required judge input does not exist: {missing_path.resolve()}",
+            ),
+            EXIT_ERROR,
+        )
+
+    judge_input = read_judge_input(request)
+    changed_files = extract_changed_files(judge_input.diff_text)
+    advisories = detect_debug_artifacts(judge_input.diff_text)
+    finished_at = iso_now()
 
     return (
         ValidationResult(
@@ -406,6 +500,17 @@ def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
                             else None
                         ),
                         "model": request.model,
+                        "changed_files": changed_files,
+                        "advisories": advisories,
+                        "input": {
+                            "diff_text": bound_output(judge_input.diff_text),
+                            "issue_text": bound_output(judge_input.issue_text),
+                            "conventions_text": (
+                                bound_output(judge_input.conventions_text)
+                                if judge_input.conventions_text is not None
+                                else None
+                            ),
+                        },
                     },
                 }
             ],
