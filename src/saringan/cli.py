@@ -122,9 +122,15 @@ def load_judge_models() -> tuple[type[object], type[object]]:
         line: int | None = None
         snippet: str | None = None
 
+    class QagCriterionModel(BaseModel):
+        criterion: str = Field(min_length=1)
+        verdict: str = Field(pattern=r"^(yes|no|idk)$")
+        rationale: str = Field(min_length=1)
+
     class JudgeResponseModel(BaseModel):
         summary: str = Field(min_length=1)
         advisories: list[JudgeAdvisoryModel] = Field(default_factory=list)
+        acceptance_criteria: list[QagCriterionModel] = Field(default_factory=list)
 
     return JudgeResponseModel, ValidationError
 
@@ -166,7 +172,9 @@ class LiteLLMJudgeClient:
                     "role": "system",
                     "content": (
                         "You are the Saringan Contextual Judge Gate. Return JSON with "
-                        "a summary string and an advisories array."
+                        "a summary string, an advisories array, and an "
+                        "acceptance_criteria array. Extract acceptance criteria from "
+                        "the issue and verify each against the diff as yes, no, or idk."
                     ),
                 },
                 {
@@ -201,6 +209,22 @@ class LiteLLMJudgeClient:
                                         "snippet": {"type": ["string", "null"]},
                                     },
                                     "required": ["kind"],
+                                },
+                            },
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "criterion": {"type": "string"},
+                                        "verdict": {
+                                            "type": "string",
+                                            "enum": ["yes", "no", "idk"],
+                                        },
+                                        "rationale": {"type": "string"},
+                                    },
+                                    "required": ["criterion", "verdict", "rationale"],
                                 },
                             },
                         },
@@ -413,6 +437,21 @@ def extract_changed_files(diff_text: str) -> list[str]:
         if candidate not in changed_files:
             changed_files.append(candidate)
     return changed_files
+
+
+def compute_completion_score(criteria: list[object]) -> float:
+    """Deterministic completion score from acceptance criteria verdicts.
+
+    Score = yes_count / (yes_count + no_count).  Criteria with verdict
+    ``idk`` are excluded from the denominator and reported as advisory.
+    An empty or all-``idk`` criteria list yields a score of 0.0.
+    """
+    verdicts = [c.verdict for c in criteria]
+    decided = [v for v in verdicts if v != "idk"]
+    if not decided:
+        return 0.0
+    yes_count = sum(1 for v in decided if v == "yes")
+    return yes_count / len(decided)
 
 
 def detect_debug_artifacts(diff_text: str) -> list[dict[str, object]]:
@@ -792,6 +831,13 @@ def judge_target(
                         "advisories": [
                             advisory.model_dump() for advisory in validated_response.advisories
                         ],
+                        "acceptance_criteria": [
+                            criterion.model_dump()
+                            for criterion in validated_response.acceptance_criteria
+                        ],
+                        "completion_score": compute_completion_score(
+                            validated_response.acceptance_criteria
+                        ),
                         "input": {
                             "diff_text": bound_output(judge_input.diff_text),
                             "issue_text": bound_output(judge_input.issue_text),
