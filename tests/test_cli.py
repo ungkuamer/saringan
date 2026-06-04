@@ -9,6 +9,15 @@ import tomllib
 import pytest
 from saringan.cli import JudgeInput, JudgeRequest, judge_target
 
+try:
+    if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+        raise ImportError()
+    import litellm
+    import pydantic
+    HAS_JUDGE_DEPS = True
+except ImportError:
+    HAS_JUDGE_DEPS = False
+
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     repo_root = Path(__file__).resolve().parents[1]
@@ -89,6 +98,7 @@ class FakeJudgeClient:
         return self.response
 
 
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
 def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
@@ -175,6 +185,7 @@ def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> No
     assert evidence["input"]["conventions_text"] == "# Conventions\n"
 
 
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
 def test_judge_target_reports_environment_failure_for_invalid_structured_output(
     tmp_path: Path,
 ) -> None:
