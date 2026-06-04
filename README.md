@@ -167,7 +167,7 @@ saringan validate <target_path> [options]
 *   `target_path`: The path to the repository directory to validate.
 *   `--config <config_path>`: Optional custom path to `saringan.toml` (defaults to `<target_path>/saringan.toml`).
 *   `--log-dir <log_dir>`: Optional directory to save check output logs (overrides `log_dir` in `saringan.toml`).
-*   `--json`: Outputs the final result as a machine-readable JSON structure on stdout.
+*   `--json`: Deprecated compatibility flag. Validation Result JSON is always written to stdout.
 
 ### Output Contract (stdout / stderr)
 
@@ -175,7 +175,7 @@ Saringan separates machine-readable and human-readable output across `stdout` an
 
 | Mode       | `stdout`                            | `stderr`                        |
 |------------|-------------------------------------|---------------------------------|
-| Default    | Human-readable validation summary   | _(unused)_                      |
+| Default    | Machine-readable Validation Result JSON | Human-readable progress lines |
 | `--json`   | Machine-readable Validation Result JSON | Human-readable progress lines |
 
 Callers parsing Saringan results MUST consume `stdout` — never scrape `stderr`, which is reserved for human-facing output.
@@ -190,7 +190,7 @@ Saringan communicates the overall validation state via standard exit codes:
 
 ## Validation Result Schema
 
-When run with the `--json` flag, Saringan returns a structured Validation Result JSON payload:
+Saringan returns a structured Validation Result JSON payload:
 
 ```json
 {

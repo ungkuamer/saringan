@@ -1,0 +1,6 @@
+schema_version = 1
+
+[[checks]]
+id = "python-tests"
+type = "python_tests"
+command = ["pytest", "-q"]
