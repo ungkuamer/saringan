@@ -5,10 +5,12 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+import os
 import subprocess
 import sys
 import time
 import tomllib
+from typing import Protocol
 
 
 EXIT_PASSED = 0
@@ -77,6 +79,131 @@ class JudgeInput:
     diff_text: str
     issue_text: str
     conventions_text: str | None
+
+
+class JudgeDependencyError(Exception):
+    pass
+
+
+class JudgeStructuredOutputError(Exception):
+    pass
+
+
+class JudgeClient(Protocol):
+    def evaluate(self, request: JudgeRequest, judge_input: JudgeInput) -> object: ...
+
+
+class JudgeStructuredOutputModel(Protocol):
+    advisories: list[object]
+
+
+def load_judge_models() -> tuple[type[object], type[object]]:
+    try:
+        if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+            raise ImportError("forced missing judge dependencies")
+        from pydantic import BaseModel, Field, ValidationError
+    except ImportError as error:
+        raise JudgeDependencyError(
+            "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+        ) from error
+
+    class JudgeAdvisoryModel(BaseModel):
+        kind: str
+        file: str | None = None
+        line: int | None = None
+        snippet: str | None = None
+
+    class JudgeResponseModel(BaseModel):
+        summary: str = Field(min_length=1)
+        advisories: list[JudgeAdvisoryModel] = Field(default_factory=list)
+
+    return JudgeResponseModel, ValidationError
+
+
+class LiteLLMJudgeClient:
+    def __init__(self) -> None:
+        try:
+            if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+                raise ImportError("forced missing judge dependencies")
+            from litellm import completion
+        except ImportError as error:
+            raise JudgeDependencyError(
+                "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+            ) from error
+        self._completion = completion
+
+    def evaluate(self, request: JudgeRequest, judge_input: JudgeInput) -> object:
+        response = self._completion(
+            model=request.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the Saringan Contextual Judge Gate. Return JSON with "
+                        "a summary string and an advisories array."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "diff_text": judge_input.diff_text,
+                            "issue_text": judge_input.issue_text,
+                            "conventions_text": judge_input.conventions_text,
+                        }
+                    ),
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "saringan_contextual_judge",
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "summary": {"type": "string"},
+                            "advisories": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "kind": {"type": "string"},
+                                        "file": {"type": ["string", "null"]},
+                                        "line": {"type": ["integer", "null"]},
+                                        "snippet": {"type": ["string", "null"]},
+                                    },
+                                    "required": ["kind"],
+                                },
+                            },
+                        },
+                        "required": ["summary", "advisories"],
+                    },
+                },
+            },
+        )
+
+        content = response["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        return json.loads(content)
+
+
+def build_judge_client() -> JudgeClient:
+    return LiteLLMJudgeClient()
+
+
+def validate_judge_response(raw_response: object) -> object:
+    JudgeResponseModel, ValidationError = load_judge_models()
+    try:
+        return JudgeResponseModel.model_validate(raw_response)
+    except ValidationError as error:
+        raise JudgeStructuredOutputError(
+            f"Judge model returned invalid structured output: {error}"
+        ) from error
 
 
 def iso_now() -> str:
@@ -232,7 +359,6 @@ def execute_command_check(
     check_id = str(check["id"])
     stable_check_id = str(check["type"])
     started_at = time.perf_counter()
-    import os
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
     try:
@@ -447,7 +573,10 @@ def validate_target(
     return result, exit_code
 
 
-def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
+def judge_target(
+    request: JudgeRequest,
+    judge_client: JudgeClient | None = None,
+) -> tuple[ValidationResult, int]:
     started_at = iso_now()
     resolved_target_path = str(request.target_path.resolve())
     required_paths = [
@@ -476,8 +605,25 @@ def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
         )
 
     judge_input = read_judge_input(request)
+    try:
+        client = judge_client if judge_client is not None else build_judge_client()
+        raw_response = client.evaluate(request, judge_input)
+        validated_response = validate_judge_response(raw_response)
+    except (JudgeDependencyError, JudgeStructuredOutputError, OSError, json.JSONDecodeError) as error:
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="error",
+                target_path=resolved_target_path,
+                config_path=None,
+                started_at=started_at,
+                finished_at=finished_at,
+                message=str(error),
+            ),
+            EXIT_ERROR,
+        )
+
     changed_files = extract_changed_files(judge_input.diff_text)
-    advisories = detect_debug_artifacts(judge_input.diff_text)
     finished_at = iso_now()
 
     return (
@@ -489,7 +635,7 @@ def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
                     "stable_check_id": "contextual_judge",
                     "status": "passed",
                     "blocking": False,
-                    "message": "Contextual Judge Gate advisory skeleton executed.",
+                    "message": validated_response.summary,
                     "evidence": {
                         "target_path": resolved_target_path,
                         "diff_path": str(request.diff_path.resolve()),
@@ -501,7 +647,9 @@ def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
                         ),
                         "model": request.model,
                         "changed_files": changed_files,
-                        "advisories": advisories,
+                        "advisories": [
+                            advisory.model_dump() for advisory in validated_response.advisories
+                        ],
                         "input": {
                             "diff_text": bound_output(judge_input.diff_text),
                             "issue_text": bound_output(judge_input.issue_text),

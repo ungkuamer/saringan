@@ -5,7 +5,18 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import tomllib
 import pytest
+from saringan.cli import JudgeInput, JudgeRequest, judge_target
+
+try:
+    if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+        raise ImportError()
+    import litellm
+    import pydantic
+    HAS_JUDGE_DEPS = True
+except ImportError:
+    HAS_JUDGE_DEPS = False
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -79,7 +90,16 @@ def test_validate_json_reports_passed_result_for_valid_target(tmp_path: Path) ->
     assert payload["finished_at"]
 
 
-def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> None:
+class FakeJudgeClient:
+    def __init__(self, response: object) -> None:
+        self.response = response
+
+    def evaluate(self, request: JudgeRequest, judge_input: JudgeInput) -> object:
+        return self.response
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     diff_path = tmp_path / "changes.diff"
@@ -107,22 +127,37 @@ def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> 
     issue_path.write_text("# Issue 21\n")
     conventions_path.write_text("# Conventions\n")
 
-    result = run_cli(
-        "judge",
-        str(target),
-        "--diff",
-        str(diff_path),
-        "--issue",
-        str(issue_path),
-        "--conventions",
-        str(conventions_path),
-        "--model",
-        "gpt-5",
-        "--json",
+    result, exit_code = judge_target(
+        JudgeRequest(
+            target_path=target,
+            diff_path=diff_path,
+            issue_path=issue_path,
+            conventions_path=conventions_path,
+            model="gpt-5",
+        ),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "Contextual Judge Gate advisory skeleton executed.",
+                "advisories": [
+                    {
+                        "kind": "debug_artifact",
+                        "file": "src/app.js",
+                        "line": 1,
+                        "snippet": "print('debug')",
+                    },
+                    {
+                        "kind": "debug_artifact",
+                        "file": "src/app.js",
+                        "line": 2,
+                        "snippet": debug_line[:2000],
+                    },
+                ],
+            }
+        ),
     )
 
-    assert result.returncode == 0
-    payload = json.loads(result.stdout)
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
     assert payload["status"] == "passed"
     assert payload["target_path"] == str(target.resolve())
     assert payload["started_at"]
@@ -148,7 +183,36 @@ def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> 
     assert evidence["input"]["issue_text"] == "# Issue 21\n"
     assert evidence["input"]["diff_text"].startswith("diff --git a/src/app.js b/src/app.js")
     assert evidence["input"]["conventions_text"] == "# Conventions\n"
-    assert "Judging" in result.stderr
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_judge_target_reports_environment_failure_for_invalid_structured_output(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 23\n")
+
+    result, exit_code = judge_target(
+        JudgeRequest(
+            target_path=target,
+            diff_path=diff_path,
+            issue_path=issue_path,
+            conventions_path=None,
+            model="gpt-5",
+        ),
+        judge_client=FakeJudgeClient({"summary": "", "advisories": "not-an-array"}),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "error"
+    assert payload["message"].startswith(
+        "Judge model returned invalid structured output:"
+    )
 
 
 @pytest.mark.parametrize(
@@ -228,6 +292,39 @@ def test_judge_reports_environment_failure_for_missing_inputs(
     )
 
 
+def test_judge_reports_environment_failure_when_judge_dependencies_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 23\n")
+
+    monkeypatch.setenv("SARINGAN_FORCE_MISSING_JUDGE_DEPS", "1")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--model",
+        "gpt-5",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == (
+        "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+    )
+
+
 def test_validate_json_reports_error_for_missing_target_path(tmp_path: Path) -> None:
     missing_target = tmp_path / "missing"
 
@@ -256,6 +353,16 @@ def test_validate_json_reports_failed_result_for_failing_check(tmp_path: Path) -
     assert payload["status"] == "failed"
     assert payload["check_outcomes"][0]["id"] == "smoke"
     assert payload["check_outcomes"][0]["status"] == "failed"
+
+
+def test_pyproject_exposes_judge_extra_dependencies() -> None:
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+    payload = tomllib.loads(pyproject_path.read_text())
+
+    judge_dependencies = payload["project"]["optional-dependencies"]["judge"]
+    assert "litellm" in judge_dependencies
+    assert "pydantic" in judge_dependencies
 
 
 def test_validate_default_output_is_parseable_json_on_stdout(tmp_path: Path) -> None:

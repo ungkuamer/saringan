@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Standalone CLI for deterministic validation."
 requires-python = ">=3.12"
 
+[project.optional-dependencies]
+judge = [
+    "litellm",
+    "pydantic",
+]
+
 [project.scripts]
 saringan = "saringan.cli:main"
 
