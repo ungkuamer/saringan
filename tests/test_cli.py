@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import pytest
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -84,7 +85,25 @@ def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> 
     diff_path = tmp_path / "changes.diff"
     issue_path = tmp_path / "issue.md"
     conventions_path = tmp_path / "conventions.md"
-    diff_path.write_text("diff --git a/file b/file\n")
+    debug_line = "console.log('debug'); " + ("x" * 2500)
+    diff_path.write_text(
+        "\n".join(
+            [
+                "diff --git a/src/app.js b/src/app.js",
+                "--- a/src/app.js",
+                "+++ b/src/app.js",
+                "@@ -1 +1,2 @@",
+                "+print('debug')",
+                f"+{debug_line}",
+                "diff --git a/tests/test_app.py b/tests/test_app.py",
+                "--- a/tests/test_app.py",
+                "+++ b/tests/test_app.py",
+                "@@ -1 +1 @@",
+                "+assert True",
+                "",
+            ]
+        )
+    )
     issue_path.write_text("# Issue 21\n")
     conventions_path.write_text("# Conventions\n")
 
@@ -117,7 +136,96 @@ def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> 
     assert evidence["issue_path"] == str(issue_path.resolve())
     assert evidence["conventions_path"] == str(conventions_path.resolve())
     assert evidence["model"] == "gpt-5"
+    assert evidence["changed_files"] == ["src/app.js", "tests/test_app.py"]
+    assert len(evidence["advisories"]) == 2
+    assert evidence["advisories"][0]["kind"] == "debug_artifact"
+    assert evidence["advisories"][0]["file"] == "src/app.js"
+    assert evidence["advisories"][0]["line"] == 1
+    assert evidence["advisories"][0]["snippet"] == "print('debug')"
+    assert evidence["advisories"][1]["kind"] == "debug_artifact"
+    assert evidence["advisories"][1]["line"] == 2
+    assert len(evidence["advisories"][1]["snippet"]) == 2000
+    assert evidence["input"]["issue_text"] == "# Issue 21\n"
+    assert evidence["input"]["diff_text"].startswith("diff --git a/src/app.js b/src/app.js")
+    assert evidence["input"]["conventions_text"] == "# Conventions\n"
     assert "Judging" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("missing_kind", "path_factory", "extra_args"),
+    [
+        (
+            "target",
+            lambda tmp_path: tmp_path / "missing-target",
+            lambda tmp_path: [],
+        ),
+        (
+            "diff",
+            lambda tmp_path: tmp_path / "missing.diff",
+            lambda tmp_path: [],
+        ),
+        (
+            "issue",
+            lambda tmp_path: tmp_path / "missing.md",
+            lambda tmp_path: [],
+        ),
+        (
+            "conventions",
+            lambda tmp_path: tmp_path / "missing-conventions.md",
+            lambda tmp_path: ["--conventions", str(tmp_path / "missing-conventions.md")],
+        ),
+    ],
+)
+def test_judge_reports_environment_failure_for_missing_inputs(
+    tmp_path: Path,
+    missing_kind: str,
+    path_factory,
+    extra_args,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 22\n")
+
+    if missing_kind == "target":
+        target_path = path_factory(tmp_path)
+        expected_missing_path = target_path
+    else:
+        target_path = target
+        expected_missing_path = path_factory(tmp_path)
+
+    if missing_kind != "diff":
+        diff_arg = str(diff_path)
+    else:
+        diff_arg = str(expected_missing_path)
+
+    if missing_kind != "issue":
+        issue_arg = str(issue_path)
+    else:
+        issue_arg = str(expected_missing_path)
+
+    result = run_cli(
+        "judge",
+        str(target_path),
+        "--diff",
+        diff_arg,
+        "--issue",
+        issue_arg,
+        "--model",
+        "gpt-5",
+        "--json",
+        *extra_args(tmp_path),
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["target_path"] == str(target_path.resolve())
+    assert payload["message"] == (
+        f"Required judge input does not exist: {expected_missing_path.resolve()}"
+    )
 
 
 def test_validate_json_reports_error_for_missing_target_path(tmp_path: Path) -> None:
