@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 import tomllib
 import pytest
-from saringan.cli import JudgeInput, JudgeRequest, judge_target
+from saringan.cli import JudgeInput, JudgeRequest, ScopeGuardClient, judge_target
 
 try:
     if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
@@ -98,6 +98,19 @@ class FakeJudgeClient:
         return self.response
 
 
+class FakeScopeGuardClient:
+    def __init__(self, response: object) -> None:
+        self.response = response
+
+    def evaluate_scope(
+        self,
+        request: JudgeRequest,
+        judge_input: JudgeInput,
+        changed_files: list[str],
+    ) -> object:
+        return self.response
+
+
 @pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
 def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> None:
     target = tmp_path / "target"
@@ -154,6 +167,9 @@ def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> No
                 ],
             }
         ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "All changed files map to the issue scope."}
+        ),
     )
 
     assert exit_code == 0
@@ -180,6 +196,8 @@ def test_judge_target_reports_validated_fake_client_result(tmp_path: Path) -> No
     assert evidence["advisories"][1]["kind"] == "debug_artifact"
     assert evidence["advisories"][1]["line"] == 2
     assert len(evidence["advisories"][1]["snippet"]) == 2000
+    assert evidence["scope_guard"]["verdict"] == "yes"
+    assert evidence["scope_guard"]["rationale"] == "All changed files map to the issue scope."
     assert evidence["input"]["issue_text"] == "# Issue 21\n"
     assert evidence["input"]["diff_text"].startswith("diff --git a/src/app.js b/src/app.js")
     assert evidence["input"]["conventions_text"] == "# Conventions\n"
@@ -205,6 +223,9 @@ def test_judge_target_reports_environment_failure_for_invalid_structured_output(
             model="gpt-5",
         ),
         judge_client=FakeJudgeClient({"summary": "", "advisories": "not-an-array"}),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
     )
 
     assert exit_code == 2
@@ -1457,3 +1478,206 @@ def test_validate_json_flag_is_noop_for_error_result(tmp_path: Path) -> None:
     assert with_json.returncode == 2
     assert without_json.returncode == 2
     assert _payload_without_timestamps(json.loads(with_json.stdout)) == _payload_without_timestamps(json.loads(without_json.stdout))
+
+
+def _make_judge_request(
+    target: Path,
+    diff_path: Path,
+    issue_path: Path,
+    conventions_path: Path | None = None,
+) -> JudgeRequest:
+    return JudgeRequest(
+        target_path=target,
+        diff_path=diff_path,
+        issue_path=issue_path,
+        conventions_path=conventions_path,
+        model="gpt-5",
+    )
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_in_scope_verdict_as_advisory_evidence(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+// in scope change\n")
+    issue_path.write_text("# Issue: Add feature to app.js\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {"summary": "All good.", "advisories": []}
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "Changed file matches issue scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "yes"
+    assert evidence["scope_guard"]["rationale"] == "Changed file matches issue scope."
+    assert evidence["changed_files"] == ["src/app.js"]
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_out_of_scope_verdict_as_advisory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/unrelated.c b/src/unrelated.c\n+void main() {}\n")
+    issue_path.write_text("# Issue: Add feature to app.js\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {"summary": "Concern noted.", "advisories": []}
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {
+                "verdict": "no",
+                "rationale": "Changed file unrelated.c is not mentioned in the issue.",
+            }
+        ),
+    )
+
+    # no verdict is advisory — exit 0
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "no"
+    assert "unrelated.c" in evidence["scope_guard"]["rationale"]
+    assert evidence["changed_files"] == ["src/unrelated.c"]
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_uncertain_verdict_as_advisory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/config.toml b/config.toml\n+timeout=30\n")
+    issue_path.write_text("# Issue: Improve performance\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {"summary": "Unclear.", "advisories": []}
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {
+                "verdict": "idk",
+                "rationale": "Cannot determine if config change relates to performance.",
+            }
+        ),
+    )
+
+    # idk verdict is advisory — exit 0
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "idk"
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_error_for_invalid_structured_output(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {"summary": "ok", "advisories": []}
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "maybe", "rationale": ""}
+        ),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "error"
+    assert payload["message"].startswith(
+        "Scope guard returned invalid structured output:"
+    )
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_error_for_missing_verdict_field(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {"summary": "ok", "advisories": []}
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"rationale": "Some rationale."}
+        ),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "error"
+    assert payload["message"].startswith(
+        "Scope guard returned invalid structured output:"
+    )
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_scope_guard_reports_error_when_dependencies_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    monkeypatch.setenv("SARINGAN_FORCE_MISSING_JUDGE_DEPS", "1")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--model",
+        "gpt-5",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["message"] == (
+        "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+    )
