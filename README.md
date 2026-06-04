@@ -11,7 +11,7 @@
 
 The ecosystem is built around two core architectural layers:
 1. **Rangkai (Orchestrator):** A state-machine engine that claims issues, spins up isolated worktrees, executes agent harnesses, and manages task integration.
-2. **Saringan (QA & Quality Gate):** A decoupled validation gate combining deterministic checks with future contextual judgement (LLM-as-a-Judge) verification pipelines (contained in this repository).
+2. **Saringan (QA & Quality Gate):** A decoupled validation gate combining blocking deterministic checks with advisory contextual judgement (LLM-as-a-Judge) verification pipelines (contained in this repository).
 
 ---
 
@@ -61,7 +61,7 @@ graph TD
 The first Saringan validation layer: a local, non-LLM gate made of repeatable static checks, tests, builds, and security scans executed directly within the agent's workspace or target directory.
 
 ### 2. Contextual Judge Gate
-The future Saringan validation layer that evaluates code changes against issue context and project conventions using LLM-based judgement (LLM-as-a-Judge).
+The second Saringan validation layer: an advisory-first, LLM-based judgement gate that evaluates code changes against issue context, acceptance criteria, and project conventions (LLM-as-a-Judge). In this first implementation, the Contextual Judge Gate is advisory only and does **not** block merge eligibility—use `saringan validate` for the blocking Deterministic Gate.
 
 ### 3. Explicit & Declarative Configuration
 Saringan adheres to strict **Explicit Configuration**—it runs only from a declared `saringan.toml` config file and does not infer validation behavior from repository heuristics. Checks are defined via **Declarative Configuration** naming parameters, dependencies, and policies without using ad-hoc shell scripting.
@@ -137,12 +137,14 @@ Clone the repository and install in editable mode:
 
 Using `uv` (recommended):
 ```bash
-uv pip install -e .
+uv pip install -e .          # Deterministic Gate only
+uv pip install -e ".[judge]"  # With optional Contextual Judge Gate (litellm, pydantic)
 ```
 
 Or using standard `pip`:
 ```bash
 python -m pip install -e .
+python -m pip install -e ".[judge]"
 ```
 
 ### Running Tests
@@ -157,50 +159,59 @@ pytest
 
 ## CLI Usage
 
-Invoke Saringan against a target repository directory path:
+### Deterministic Gate (`saringan validate`)
+
+Invoke the blocking Deterministic Gate against a target repository:
 
 ```bash
-saringan validate <target_path> [options]
+saringan validate <target_path> [--config <config_path>] [--log-dir <log_dir>]
 ```
 
-For the advisory Contextual Judge Gate preflight:
+| Argument / Option   | Required | Description |
+|---------------------|----------|-------------|
+| `target_path`       | Yes      | Path to the repository directory to validate. |
+| `--config <path>`   | No       | Custom path to `saringan.toml` (defaults to `<target_path>/saringan.toml`). |
+| `--log-dir <dir>`   | No       | Directory to save check output logs (overrides `log_dir` in `saringan.toml`). |
+
+### Contextual Judge Gate (`saringan judge`)
+
+Run the advisory Contextual Judge Gate against a diff and issue specification. The judge reads the diff, issue, and optional project conventions, then submits them to an LLM for structured evaluation including scope guard, code advisories, and acceptance-criteria verification.
 
 ```bash
-saringan judge <target_path> --diff <diff_path> --issue <issue_path> [options]
+saringan judge <target_path> --diff <diff_path> --issue <issue_path> --model <model> [--conventions <conventions_path>]
 ```
 
-### Options
-*   `target_path`: The path to the repository directory to validate.
-*   `--config <config_path>`: Optional custom path to `saringan.toml` (defaults to `<target_path>/saringan.toml`).
-*   `--log-dir <log_dir>`: Optional directory to save check output logs (overrides `log_dir` in `saringan.toml`).
-*   `--json`: Deprecated compatibility flag. Validation Result JSON is always written to stdout.
-*   `judge --diff <diff_path>`: Required path to the diff artifact for Contextual Judge Gate input.
-*   `judge --issue <issue_path>`: Required path to the issue/context artifact for Contextual Judge Gate input.
-*   `judge --conventions <conventions_path>`: Optional project conventions artifact. If provided, the file must exist.
-*   `judge --model <model>`: Required model identifier to record in the advisory result payload.
-
-The current `judge` command performs deterministic preflight only. It reads the diff and issue artifacts, optionally reads conventions, extracts changed files from standard `diff --git` headers, detects obvious added debug artifacts such as `print(...)` and `console.log(...)`, and returns bounded advisory evidence in the JSON payload before any LLM provider is involved.
+| Argument / Option        | Required | Description |
+|--------------------------|----------|-------------|
+| `target_path`            | Yes      | Path to the repository directory (used for result metadata). |
+| `--diff <path>`          | Yes      | Path to a `diff` artifact (e.g., `git diff` output). File must exist. |
+| `--issue <path>`         | Yes      | Path to the issue/context artifact (e.g., issue markdown). File must exist. |
+| `--model <model>`        | Yes      | LLM model identifier (e.g., `openai/gpt-4o`). Recorded in the result payload. |
+| `--conventions <path>`   | No       | Optional project conventions artifact. If provided, the file must exist. |
 
 ### Output Contract (stdout / stderr)
 
-Saringan separates machine-readable and human-readable output across `stdout` and `stderr`:
+Saringan separates machine-readable and human-readable output across `stdout` and `stderr` for both `validate` and `judge`:
 
-| Mode       | `stdout`                            | `stderr`                        |
-|------------|-------------------------------------|---------------------------------|
-| Default    | Machine-readable Validation Result JSON | Human-readable progress lines |
-| `--json`   | Machine-readable Validation Result JSON | Human-readable progress lines |
+| Mode     | `stdout`                                | `stderr`                       |
+|----------|-----------------------------------------|--------------------------------|
+| Default  | Machine-readable Validation Result JSON | Human-readable progress lines  |
 
 Callers parsing Saringan results MUST consume `stdout` — never scrape `stderr`, which is reserved for human-facing output.
 
 ### Exit Codes
-Saringan communicates the overall validation state via standard exit codes:
-*   `0` (`passed`): All configured blocking checks passed successfully.
-*   `1` (`failed`): One or more blocking checks failed.
-*   `2` (`error`): An environment failure or configuration error occurred (e.g., malformed config, missing directory).
+
+| Code | Label    | Meaning |
+|------|----------|---------|
+| `0`  | `passed` | **Validate**: All configured blocking checks passed. **Judge**: Advisory evaluation completed and produced valid structured output. |
+| `1`  | `failed` | One or more blocking checks failed (`validate` only). The judge command never returns exit code 1. |
+| `2`  | `error`  | An environment failure occurred (e.g., missing input files, malformed configuration, judge dependencies not installed, invalid LLM response). |
 
 ---
 
 ## Validation Result Schema
+
+### `saringan validate` Example Result
 
 Saringan returns a structured Validation Result JSON payload:
 
@@ -245,6 +256,66 @@ Saringan returns a structured Validation Result JSON payload:
   ]
 }
 ```
+
+### `saringan judge` Example Result
+
+The Contextual Judge Gate returns a `passed` status with advisory evidence when it completes successfully:
+
+```json
+{
+  "status": "passed",
+  "target_path": "/home/ungku/programming/saringan",
+  "config_path": null,
+  "started_at": "2026-06-04T12:00:00.000000+00:00",
+  "finished_at": "2026-06-04T12:00:03.456789+00:00",
+  "message": null,
+  "check_outcomes": [
+    {
+      "id": "contextual_judge",
+      "stable_check_id": "contextual_judge",
+      "status": "passed",
+      "blocking": false,
+      "message": "Code changes satisfy the issue acceptance criteria.",
+      "evidence": {
+        "target_path": "/home/ungku/programming/saringan",
+        "diff_path": "/tmp/changes.diff",
+        "issue_path": "/tmp/issue.md",
+        "conventions_path": null,
+        "model": "openai/gpt-4o",
+        "changed_files": ["src/app.js"],
+        "scope_guard": {
+          "verdict": "yes",
+          "rationale": "All changed files map to the issue scope."
+        },
+        "advisories": [
+          {
+            "kind": "debug_artifact",
+            "file": "src/app.js",
+            "line": 10,
+            "snippet": "print('TODO: remove')"
+          }
+        ],
+        "acceptance_criteria": [
+          {
+            "criterion": "README documents installation",
+            "verdict": "yes",
+            "rationale": "Installation section documents pip install with judge extra."
+          }
+        ],
+        "completion_score": 1.0,
+        "input": {
+          "diff_text": "diff --git a/src/app.js b/src/app.js\n...",
+          "issue_text": "# Issue ...",
+          "conventions_text": null
+        }
+      }
+    }
+  ]
+}
+```
+
+> [!IMPORTANT]
+> The `saringan judge` command is **advisory-first**. Exit code `0` means the judge completed successfully, not that the code is approved. The Contextual Judge Gate does **not** block merge eligibility in this first implementation. Use `saringan validate` for the blocking Deterministic Gate.
 
 ---
 
