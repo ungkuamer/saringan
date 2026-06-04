@@ -93,6 +93,15 @@ class JudgeClient(Protocol):
     def evaluate(self, request: JudgeRequest, judge_input: JudgeInput) -> object: ...
 
 
+class ScopeGuardClient(Protocol):
+    def evaluate_scope(
+        self,
+        request: JudgeRequest,
+        judge_input: JudgeInput,
+        changed_files: list[str],
+    ) -> object: ...
+
+
 class JudgeStructuredOutputModel(Protocol):
     advisories: list[object]
 
@@ -118,6 +127,23 @@ def load_judge_models() -> tuple[type[object], type[object]]:
         advisories: list[JudgeAdvisoryModel] = Field(default_factory=list)
 
     return JudgeResponseModel, ValidationError
+
+
+def load_scope_guard_models() -> tuple[type[object], type[object]]:
+    try:
+        if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+            raise ImportError("forced missing judge dependencies")
+        from pydantic import BaseModel, Field, ValidationError
+    except ImportError as error:
+        raise JudgeDependencyError(
+            "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+        ) from error
+
+    class ScopeGuardVerdictModel(BaseModel):
+        verdict: str = Field(pattern=r"^(yes|no|idk)$")
+        rationale: str = Field(min_length=1, max_length=500)
+
+    return ScopeGuardVerdictModel, ValidationError
 
 
 class LiteLLMJudgeClient:
@@ -203,6 +229,90 @@ def validate_judge_response(raw_response: object) -> object:
     except ValidationError as error:
         raise JudgeStructuredOutputError(
             f"Judge model returned invalid structured output: {error}"
+        ) from error
+
+
+class LiteLLMScopeGuardClient:
+    def __init__(self) -> None:
+        try:
+            if os.environ.get("SARINGAN_FORCE_MISSING_JUDGE_DEPS") == "1":
+                raise ImportError("forced missing judge dependencies")
+            from litellm import completion
+        except ImportError as error:
+            raise JudgeDependencyError(
+                "Judge dependencies are not installed. Reinstall with the 'judge' extra."
+            ) from error
+        self._completion = completion
+
+    def evaluate_scope(
+        self,
+        request: JudgeRequest,
+        judge_input: JudgeInput,
+        changed_files: list[str],
+    ) -> object:
+        response = self._completion(
+            model=request.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the Saringan Scope Guard. Your job is to judge whether "
+                        "the changed files in a diff stay within the intended scope of "
+                        "an issue specification. Return JSON with a verdict (yes, no, or "
+                        "idk) and a concise rationale."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "changed_files": changed_files,
+                            "diff_text": judge_input.diff_text,
+                            "issue_text": judge_input.issue_text,
+                            "conventions_text": judge_input.conventions_text,
+                        }
+                    ),
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "saringan_scope_guard",
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "verdict": {
+                                "type": "string",
+                                "enum": ["yes", "no", "idk"],
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["verdict", "rationale"],
+                    },
+                },
+            },
+        )
+
+        content = response["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        return json.loads(content)
+
+
+def build_scope_guard_client() -> ScopeGuardClient:
+    return LiteLLMScopeGuardClient()
+
+
+def validate_scope_guard_response(raw_response: object) -> object:
+    ScopeGuardVerdictModel, ValidationError = load_scope_guard_models()
+    try:
+        return ScopeGuardVerdictModel.model_validate(raw_response)
+    except ValidationError as error:
+        raise JudgeStructuredOutputError(
+            f"Scope guard returned invalid structured output: {error}"
         ) from error
 
 
@@ -576,6 +686,7 @@ def validate_target(
 def judge_target(
     request: JudgeRequest,
     judge_client: JudgeClient | None = None,
+    scope_guard_client: ScopeGuardClient | None = None,
 ) -> tuple[ValidationResult, int]:
     started_at = iso_now()
     resolved_target_path = str(request.target_path.resolve())
@@ -605,6 +716,37 @@ def judge_target(
         )
 
     judge_input = read_judge_input(request)
+    changed_files = extract_changed_files(judge_input.diff_text)
+
+    scope_guard_verdict: dict[str, str] | None = None
+    try:
+        sg_client = (
+            scope_guard_client
+            if scope_guard_client is not None
+            else build_scope_guard_client()
+        )
+        raw_scope = sg_client.evaluate_scope(request, judge_input, changed_files)
+        validated_scope = validate_scope_guard_response(raw_scope)
+        scope_guard_verdict = validated_scope.model_dump()
+    except (
+        JudgeDependencyError,
+        JudgeStructuredOutputError,
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="error",
+                target_path=resolved_target_path,
+                config_path=None,
+                started_at=started_at,
+                finished_at=finished_at,
+                message=str(error),
+            ),
+            EXIT_ERROR,
+        )
+
     try:
         client = judge_client if judge_client is not None else build_judge_client()
         raw_response = client.evaluate(request, judge_input)
@@ -623,7 +765,6 @@ def judge_target(
             EXIT_ERROR,
         )
 
-    changed_files = extract_changed_files(judge_input.diff_text)
     finished_at = iso_now()
 
     return (
@@ -647,6 +788,7 @@ def judge_target(
                         ),
                         "model": request.model,
                         "changed_files": changed_files,
+                        "scope_guard": scope_guard_verdict,
                         "advisories": [
                             advisory.model_dump() for advisory in validated_response.advisories
                         ],
