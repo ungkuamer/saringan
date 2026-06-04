@@ -62,6 +62,15 @@ class ConfigError:
     message: str
 
 
+@dataclass
+class JudgeRequest:
+    target_path: Path
+    diff_path: Path
+    issue_path: Path
+    conventions_path: Path | None
+    model: str
+
+
 def iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -372,6 +381,43 @@ def validate_target(
     return result, exit_code
 
 
+def judge_target(request: JudgeRequest) -> tuple[ValidationResult, int]:
+    started_at = iso_now()
+    finished_at = iso_now()
+    resolved_target_path = str(request.target_path.resolve())
+
+    return (
+        ValidationResult(
+            status="passed",
+            check_outcomes=[
+                {
+                    "id": "contextual_judge",
+                    "stable_check_id": "contextual_judge",
+                    "status": "passed",
+                    "blocking": False,
+                    "message": "Contextual Judge Gate advisory skeleton executed.",
+                    "evidence": {
+                        "target_path": resolved_target_path,
+                        "diff_path": str(request.diff_path.resolve()),
+                        "issue_path": str(request.issue_path.resolve()),
+                        "conventions_path": (
+                            str(request.conventions_path.resolve())
+                            if request.conventions_path is not None
+                            else None
+                        ),
+                        "model": request.model,
+                    },
+                }
+            ],
+            target_path=resolved_target_path,
+            config_path=None,
+            started_at=started_at,
+            finished_at=finished_at,
+        ),
+        EXIT_PASSED,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="saringan")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -381,6 +427,14 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--config", dest="config_path")
     validate_parser.add_argument("--log-dir", dest="log_dir")
     validate_parser.add_argument("--json", action="store_true", dest="json_mode")
+
+    judge_parser = subparsers.add_parser("judge")
+    judge_parser.add_argument("target_path")
+    judge_parser.add_argument("--diff", required=True, dest="diff_path")
+    judge_parser.add_argument("--issue", required=True, dest="issue_path")
+    judge_parser.add_argument("--conventions", dest="conventions_path")
+    judge_parser.add_argument("--model", required=True)
+    judge_parser.add_argument("--json", action="store_true", dest="json_mode")
     return parser
 
 
@@ -388,20 +442,34 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command != "validate":
+    if args.command == "validate":
+        config_path = Path(args.config_path) if args.config_path else None
+        log_dir = Path(args.log_dir) if args.log_dir else None
+        result, exit_code = validate_target(
+            Path(args.target_path),
+            config_path=config_path,
+            log_dir=log_dir,
+        )
+        print(f"Validating {result.target_path}", file=sys.stderr)
+        print(f"Validation {result.status}: {result.target_path}", file=sys.stderr)
+    elif args.command == "judge":
+        result, exit_code = judge_target(
+            JudgeRequest(
+                target_path=Path(args.target_path),
+                diff_path=Path(args.diff_path),
+                issue_path=Path(args.issue_path),
+                conventions_path=(
+                    Path(args.conventions_path) if args.conventions_path else None
+                ),
+                model=args.model,
+            )
+        )
+        print(f"Judging {result.target_path}", file=sys.stderr)
+        print(f"Judge {result.status}: {result.target_path}", file=sys.stderr)
+    else:
         parser.error("unknown command")
 
-    config_path = Path(args.config_path) if args.config_path else None
-    log_dir = Path(args.log_dir) if args.log_dir else None
-    result, exit_code = validate_target(
-        Path(args.target_path),
-        config_path=config_path,
-        log_dir=log_dir,
-    )
     payload = json.dumps(asdict(result))
-    # Human-readable and progress output always goes to stderr.
-    print(f"Validating {result.target_path}", file=sys.stderr)
-    print(f"Validation {result.status}: {result.target_path}", file=sys.stderr)
     if result.message:
         print(result.message, file=sys.stderr)
     # Machine-readable Validation Result JSON always goes to stdout.

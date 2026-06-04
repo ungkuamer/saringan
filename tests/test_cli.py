@@ -78,6 +78,48 @@ def test_validate_json_reports_passed_result_for_valid_target(tmp_path: Path) ->
     assert payload["finished_at"]
 
 
+def test_judge_json_reports_advisory_contextual_judge_result(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    conventions_path = tmp_path / "conventions.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 21\n")
+    conventions_path.write_text("# Conventions\n")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--conventions",
+        str(conventions_path),
+        "--model",
+        "gpt-5",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert payload["target_path"] == str(target.resolve())
+    assert payload["started_at"]
+    assert payload["finished_at"]
+    assert len(payload["check_outcomes"]) == 1
+    assert payload["check_outcomes"][0]["stable_check_id"] == "contextual_judge"
+    assert payload["check_outcomes"][0]["status"] == "passed"
+    assert payload["check_outcomes"][0]["blocking"] is False
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["diff_path"] == str(diff_path.resolve())
+    assert evidence["issue_path"] == str(issue_path.resolve())
+    assert evidence["conventions_path"] == str(conventions_path.resolve())
+    assert evidence["model"] == "gpt-5"
+    assert "Judging" in result.stderr
+
+
 def test_validate_json_reports_error_for_missing_target_path(tmp_path: Path) -> None:
     missing_target = tmp_path / "missing"
 

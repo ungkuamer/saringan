@@ -163,11 +163,21 @@ Invoke Saringan against a target repository directory path:
 saringan validate <target_path> [options]
 ```
 
+For the advisory Contextual Judge Gate skeleton:
+
+```bash
+saringan judge <target_path> --diff <diff_path> --issue <issue_path> [options]
+```
+
 ### Options
 *   `target_path`: The path to the repository directory to validate.
 *   `--config <config_path>`: Optional custom path to `saringan.toml` (defaults to `<target_path>/saringan.toml`).
 *   `--log-dir <log_dir>`: Optional directory to save check output logs (overrides `log_dir` in `saringan.toml`).
 *   `--json`: Deprecated compatibility flag. Validation Result JSON is always written to stdout.
+*   `judge --diff <diff_path>`: Required path to the diff artifact for Contextual Judge Gate input.
+*   `judge --issue <issue_path>`: Required path to the issue/context artifact for Contextual Judge Gate input.
+*   `judge --conventions <conventions_path>`: Optional project conventions artifact.
+*   `judge --model <model>`: Required model identifier to record in the advisory result payload.
 
 ### Output Contract (stdout / stderr)
 
