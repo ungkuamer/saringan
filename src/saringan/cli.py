@@ -157,12 +157,16 @@ def execute_command_check(
     check_id = str(check["id"])
     stable_check_id = str(check["type"])
     started_at = time.perf_counter()
+    import os
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
     try:
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
             cwd=target_path,
+            env=env,
             check=False,
         )
     except OSError as error:
