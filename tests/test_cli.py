@@ -1681,3 +1681,355 @@ def test_scope_guard_reports_error_when_dependencies_unavailable(
     assert payload["message"] == (
         "Judge dependencies are not installed. Reinstall with the 'judge' extra."
     )
+
+
+# ── QAG acceptance criteria verification tests ────────────────────────────
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_criteria_all_pass_yields_completion_score_one(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+function add() {}\n")
+    issue_path.write_text(
+        "# Issue: Add feature\n\n"
+        "## Acceptance criteria\n"
+        "- [ ] Add function implemented\n"
+        "- [ ] Tests pass\n"
+    )
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "All criteria satisfied.",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Add function implemented",
+                        "verdict": "yes",
+                        "rationale": "Found add() function in diff.",
+                    },
+                    {
+                        "criterion": "Tests pass",
+                        "verdict": "yes",
+                        "rationale": "Test changes present.",
+                    },
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert "acceptance_criteria" in evidence
+    assert evidence["completion_score"] == 1.0
+    assert len(evidence["acceptance_criteria"]) == 2
+    assert evidence["acceptance_criteria"][0]["criterion"] == "Add function implemented"
+    assert evidence["acceptance_criteria"][0]["verdict"] == "yes"
+    assert evidence["acceptance_criteria"][1]["criterion"] == "Tests pass"
+    assert evidence["acceptance_criteria"][1]["verdict"] == "yes"
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_criteria_one_fail_yields_partial_completion_score(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+function add() {}\n")
+    issue_path.write_text("# Issue: Add and test feature\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "Partial completion.",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Add function implemented",
+                        "verdict": "yes",
+                        "rationale": "Found add() function.",
+                    },
+                    {
+                        "criterion": "Tests added",
+                        "verdict": "no",
+                        "rationale": "No test file changes detected.",
+                    },
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["completion_score"] == 0.5
+    assert len(evidence["acceptance_criteria"]) == 2
+    assert evidence["acceptance_criteria"][0]["verdict"] == "yes"
+    assert evidence["acceptance_criteria"][1]["verdict"] == "no"
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_criteria_one_uncertain_excluded_from_denominator(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+function add() {}\n")
+    issue_path.write_text("# Issue: Add feature\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "One uncertain criterion.",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Add function implemented",
+                        "verdict": "yes",
+                        "rationale": "Found add() function.",
+                    },
+                    {
+                        "criterion": "Documentation updated",
+                        "verdict": "idk",
+                        "rationale": "Cannot determine from diff alone.",
+                    },
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    # Only "yes" and "no" count; "idk" is excluded → 1 yes / 1 decided = 1.0
+    assert evidence["completion_score"] == 1.0
+    assert evidence["acceptance_criteria"][1]["verdict"] == "idk"
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_empty_criteria_yields_completion_score_zero(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+function add() {}\n")
+    issue_path.write_text("# Issue: No criteria listed\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "No criteria found.",
+                "advisories": [],
+                "acceptance_criteria": [],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["completion_score"] == 0.0
+    assert evidence["acceptance_criteria"] == []
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_all_uncertain_yields_completion_score_zero(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n+function add() {}\n")
+    issue_path.write_text("# Issue: Ambiguous requirements\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "All uncertain.",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Some vague requirement",
+                        "verdict": "idk",
+                        "rationale": "Cannot determine.",
+                    },
+                    {
+                        "criterion": "Another vague requirement",
+                        "verdict": "idk",
+                        "rationale": "Cannot determine.",
+                    },
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    # All idk → no decided criteria → score 0.0
+    assert evidence["completion_score"] == 0.0
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_reports_error_for_invalid_criteria_verdict(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "ok",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Something",
+                        "verdict": "maybe",
+                        "rationale": "Not a valid verdict.",
+                    }
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "error"
+    assert payload["message"].startswith(
+        "Judge model returned invalid structured output:"
+    )
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_reports_error_for_missing_criterion_field(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "ok",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "verdict": "yes",
+                        "rationale": "Missing criterion text.",
+                    }
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "error"
+    assert payload["message"].startswith(
+        "Judge model returned invalid structured output:"
+    )
+
+
+@pytest.mark.skipif(not HAS_JUDGE_DEPS, reason="Requires 'judge' extra dependencies")
+def test_qag_acceptance_criteria_are_advisory_only(
+    tmp_path: Path,
+) -> None:
+    """All criteria failing should still exit 0 because findings are advisory."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.js b/src/app.js\n// empty diff\n")
+    issue_path.write_text("# Issue: Big feature\n")
+
+    result, exit_code = judge_target(
+        _make_judge_request(target, diff_path, issue_path),
+        judge_client=FakeJudgeClient(
+            {
+                "summary": "Nothing done.",
+                "advisories": [],
+                "acceptance_criteria": [
+                    {
+                        "criterion": "Implement feature X",
+                        "verdict": "no",
+                        "rationale": "No implementation found.",
+                    },
+                    {
+                        "criterion": "Add tests for X",
+                        "verdict": "no",
+                        "rationale": "No tests found.",
+                    },
+                    {
+                        "criterion": "Update docs for X",
+                        "verdict": "no",
+                        "rationale": "No doc changes.",
+                    },
+                ],
+            }
+        ),
+        scope_guard_client=FakeScopeGuardClient(
+            {"verdict": "yes", "rationale": "In scope."}
+        ),
+    )
+
+    # All criteria failing — still advisory, exit 0
+    assert exit_code == 0
+    payload = json.loads(json.dumps(result, default=lambda value: value.__dict__))
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["completion_score"] == 0.0
