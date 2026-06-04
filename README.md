@@ -75,17 +75,20 @@ Saringan collects outcomes from all runnable declared checks before returning a 
 
 Saringan reads its configuration from the canonical `saringan.toml` file in the root of the target repository (or via the `--config` flag).
 
-### Check Catalog Types
-Saringan understands the following check types in its standard catalog:
+### Check Catalog — Stable Check IDs
+
+Saringan identifies checks through canonical **Stable Check IDs**, which are `snake_case` names used in dependency resolution, configuration validation, and result reporting:
 *   `command`: Generic custom command execution.
-*   `javascript-lint`: JS/TS lint checks (e.g. eslint).
-*   `javascript-tests`: JavaScript test execution (e.g. vitest, jest).
-*   `javascript-build`: JS build validation (e.g. tsc, vite build).
-*   `python-lint`: Python style and syntax check (e.g. ruff, flake8).
-*   `python-typecheck`: Python type checker (e.g. pyright, mypy).
-*   `python-tests`: Python unit test suites (e.g. pytest).
-*   `secrets-scan`: Credentials/secrets detection scans (e.g. gitleaks).
-*   `environment-file-guard`: Checks defending against committing env/secrets templates.
+*   `javascript_lint`: JS/TS lint checks (e.g. eslint).
+*   `javascript_tests`: JavaScript test execution (e.g. vitest, jest).
+*   `javascript_build`: JS build validation (e.g. tsc, vite build).
+*   `python_lint`: Python style and syntax check (e.g. ruff, flake8).
+*   `python_typecheck`: Python type checker (e.g. pyright, mypy).
+*   `python_tests`: Python unit test suites (e.g. pytest).
+*   `secrets_scan`: Credentials/secrets detection scans (e.g. gitleaks).
+*   `environment_file_guard`: Checks defending against committing env/secrets templates.
+
+Deprecated kebab-case aliases (e.g. `secrets-scan`, `python-lint`) are accepted as configuration input but are normalized to the canonical `snake_case` Stable Check IDs before processing.
 
 ### Configuration Example
 
@@ -97,25 +100,25 @@ log_dir = "logs/saringan"
 
 [[checks]]
 id = "secrets-scan"
-type = "secrets-scan"
+type = "secrets_scan"
 command = ["gitleaks", "detect", "--source=.", "--verbose", "--no-git"]
 
 [[checks]]
 id = "python-lint"
-type = "python-lint"
+type = "python_lint"
 command = ["ruff", "check", "src"]
 depends_on = ["secrets-scan"]
 
 [[checks]]
 id = "python-typecheck"
-type = "python-typecheck"
+type = "python_typecheck"
 command = ["pyright", "src"]
 depends_on = ["python-lint"]
 advisory = true # Failures here won't block merges, but will be reported
 
 [[checks]]
 id = "python-tests"
-type = "python-tests"
+type = "python_tests"
 command = ["pytest"]
 depends_on = ["python-lint"]
 ```
@@ -166,6 +169,17 @@ saringan validate <target_path> [options]
 *   `--log-dir <log_dir>`: Optional directory to save check output logs (overrides `log_dir` in `saringan.toml`).
 *   `--json`: Outputs the final result as a machine-readable JSON structure on stdout.
 
+### Output Contract (stdout / stderr)
+
+Saringan separates machine-readable and human-readable output across `stdout` and `stderr`:
+
+| Mode       | `stdout`                            | `stderr`                        |
+|------------|-------------------------------------|---------------------------------|
+| Default    | Human-readable validation summary   | _(unused)_                      |
+| `--json`   | Machine-readable Validation Result JSON | Human-readable progress lines |
+
+Callers parsing Saringan results MUST consume `stdout` — never scrape `stderr`, which is reserved for human-facing output.
+
 ### Exit Codes
 Saringan communicates the overall validation state via standard exit codes:
 *   `0` (`passed`): All configured blocking checks passed successfully.
@@ -189,6 +203,7 @@ When run with the `--json` flag, Saringan returns a structured Validation Result
   "check_outcomes": [
     {
       "id": "secrets-scan",
+      "stable_check_id": "secrets_scan",
       "status": "passed",
       "blocking": true,
       "evidence": {
@@ -202,6 +217,7 @@ When run with the `--json` flag, Saringan returns a structured Validation Result
     },
     {
       "id": "python-lint",
+      "stable_check_id": "python_lint",
       "status": "passed",
       "blocking": true,
       "evidence": {

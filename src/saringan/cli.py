@@ -15,20 +15,34 @@ EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
 SUPPORTED_SCHEMA_VERSIONS = {1}
-ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "fixture_status", "checks", "log_dir"}
+ALLOWED_TOP_LEVEL_FIELDS = {"schema_version", "checks", "log_dir"}
 ALLOWED_EXECUTABLE_CHECK_FIELDS = {"id", "type", "command", "advisory", "depends_on"}
-CHECK_FIELDS_BY_TYPE = {
-    "command": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "javascript-lint": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "javascript-tests": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "javascript-build": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "python-lint": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "python-typecheck": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "python-tests": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "secrets-scan": ALLOWED_EXECUTABLE_CHECK_FIELDS,
-    "environment-file-guard": ALLOWED_EXECUTABLE_CHECK_FIELDS,
+
+STABLE_CHECK_IDS = {
+    "command",
+    "javascript_lint",
+    "javascript_tests",
+    "javascript_build",
+    "python_lint",
+    "python_typecheck",
+    "python_tests",
+    "secrets_scan",
+    "environment_file_guard",
 }
-SUPPORTED_CHECK_TYPES = set(CHECK_FIELDS_BY_TYPE)
+
+DEPRECATED_TYPE_ALIASES: dict[str, str] = {
+    "javascript-lint": "javascript_lint",
+    "javascript-tests": "javascript_tests",
+    "javascript-build": "javascript_build",
+    "python-lint": "python_lint",
+    "python-typecheck": "python_typecheck",
+    "python-tests": "python_tests",
+    "secrets-scan": "secrets_scan",
+    "environment-file-guard": "environment_file_guard",
+}
+
+CHECK_FIELDS_BY_TYPE = {check_id: ALLOWED_EXECUTABLE_CHECK_FIELDS for check_id in STABLE_CHECK_IDS}
+SUPPORTED_CHECK_TYPES = set(CHECK_FIELDS_BY_TYPE) | set(DEPRECATED_TYPE_ALIASES)
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
 
 
@@ -86,10 +100,13 @@ def load_config(config_path: Path) -> dict[str, object] | ConfigError:
             if check_type not in SUPPORTED_CHECK_TYPES:
                 return ConfigError(message=f"Unsupported check type: {check_type}")
 
-            unknown_fields = sorted(set(check) - CHECK_FIELDS_BY_TYPE[check_type])
+            canonical_type = DEPRECATED_TYPE_ALIASES.get(str(check_type), str(check_type))
+            check["type"] = canonical_type
+
+            unknown_fields = sorted(set(check) - CHECK_FIELDS_BY_TYPE[canonical_type])
             if unknown_fields:
                 field_list = ", ".join(unknown_fields)
-                label = "command" if check_type == "command" else check_type
+                label = "command" if canonical_type == "command" else canonical_type
                 return ConfigError(message=f"Unknown fields for {label} check: {field_list}")
 
             command = check.get("command")
@@ -138,6 +155,7 @@ def execute_command_check(
 ) -> dict[str, object]:
     command = list(check["command"])
     check_id = str(check["id"])
+    stable_check_id = str(check["type"])
     started_at = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -163,6 +181,7 @@ def execute_command_check(
             evidence["log_path"] = log_path
         return {
             "id": check_id,
+            "stable_check_id": stable_check_id,
             "status": "error",
             "evidence": evidence,
         }
@@ -182,6 +201,7 @@ def execute_command_check(
         evidence["log_path"] = log_path
     return {
         "id": check_id,
+        "stable_check_id": stable_check_id,
         "status": status,
         "evidence": evidence,
     }
@@ -210,6 +230,7 @@ def aggregate_validation_status(check_outcomes: list[dict[str, object]]) -> str:
 def build_skipped_outcome(check: dict[str, object], reason: str) -> dict[str, object]:
     return {
         "id": str(check["id"]),
+        "stable_check_id": str(check["type"]),
         "status": "skipped",
         "reason": reason,
         "blocking": not bool(check.get("advisory", False)),
@@ -269,54 +290,65 @@ def validate_target(
             EXIT_ERROR,
         )
 
-    if "checks" in config_data:
-        configured_log_dir = config_data.get("log_dir")
-        if log_dir is None and isinstance(configured_log_dir, str) and configured_log_dir.strip():
-            log_dir = target_path / configured_log_dir
-        declared_checks = {str(check["id"]): check for check in config_data["checks"]}
-        check_outcomes = []
-        for check in config_data["checks"]:
-            missing_dependency = next(
-                (
-                    dependency_id
-                    for dependency_id in dependency_ids(check)
-                    if dependency_id not in declared_checks
-                ),
-                None,
-            )
-            if missing_dependency is not None:
-                finished_at = iso_now()
-                return (
-                    ValidationResult(
-                        status="error",
-                        target_path=resolved_target_path,
-                        config_path=str(resolved_config_path.resolve()),
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        message=(
-                            f"Check '{check['id']}' depends on unknown check id: {missing_dependency}"
-                        ),
+    declared_checks_list = config_data.get("checks")
+    if not declared_checks_list:
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="error",
+                target_path=resolved_target_path,
+                config_path=str(resolved_config_path.resolve()),
+                started_at=started_at,
+                finished_at=finished_at,
+                message="Configuration does not declare any checks. A saringan.toml must declare at least one [[checks]] entry.",
+            ),
+            EXIT_ERROR,
+        )
+
+    configured_log_dir = config_data.get("log_dir")
+    if log_dir is None and isinstance(configured_log_dir, str) and configured_log_dir.strip():
+        log_dir = target_path / configured_log_dir
+    declared_checks = {str(check["id"]): check for check in config_data["checks"]}
+    check_outcomes = []
+    for check in config_data["checks"]:
+        missing_dependency = next(
+            (
+                dependency_id
+                for dependency_id in dependency_ids(check)
+                if dependency_id not in declared_checks
+            ),
+            None,
+        )
+        if missing_dependency is not None:
+            finished_at = iso_now()
+            return (
+                ValidationResult(
+                    status="error",
+                    target_path=resolved_target_path,
+                    config_path=str(resolved_config_path.resolve()),
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    message=(
+                        f"Check '{check['id']}' depends on unknown check id: {missing_dependency}"
                     ),
-                    EXIT_ERROR,
-                )
+                ),
+                EXIT_ERROR,
+            )
 
-        outcome_by_id: dict[str, dict[str, object]] = {}
-        for check in config_data["checks"]:
-            dependency_outcomes = [outcome_by_id[dep] for dep in dependency_ids(check)]
-            if any(outcome["status"] != "passed" for outcome in dependency_outcomes):
-                outcome = build_skipped_outcome(check, "unsatisfied dependency")
-                outcome_by_id[str(check["id"])] = outcome
-                check_outcomes.append(outcome)
-                continue
-
-            outcome = execute_command_check(check, target_path, log_dir=log_dir)
-            outcome["blocking"] = not bool(check.get("advisory", False))
+    outcome_by_id: dict[str, dict[str, object]] = {}
+    for check in config_data["checks"]:
+        dependency_outcomes = [outcome_by_id[dep] for dep in dependency_ids(check)]
+        if any(outcome["status"] != "passed" for outcome in dependency_outcomes):
+            outcome = build_skipped_outcome(check, "unsatisfied dependency")
             outcome_by_id[str(check["id"])] = outcome
             check_outcomes.append(outcome)
-        status = aggregate_validation_status(check_outcomes)
-    else:
-        status = str(config_data.get("fixture_status", "passed"))
-        check_outcomes = [{"id": "fixture", "status": status}]
+            continue
+
+        outcome = execute_command_check(check, target_path, log_dir=log_dir)
+        outcome["blocking"] = not bool(check.get("advisory", False))
+        outcome_by_id[str(check["id"])] = outcome
+        check_outcomes.append(outcome)
+    status = aggregate_validation_status(check_outcomes)
 
     finished_at = iso_now()
     result = ValidationResult(
@@ -363,15 +395,11 @@ def main(argv: list[str] | None = None) -> int:
         log_dir=log_dir,
     )
     payload = json.dumps(asdict(result))
-    progress_line = f"Validating {result.target_path}"
-    if args.json_mode:
-        print(progress_line, file=sys.stderr)
-        if result.message:
-            print(result.message, file=sys.stderr)
-        print(payload)
-    else:
-        print(progress_line)
-        print(f"Validation {result.status}: {result.target_path}")
-        if result.message:
-            print(result.message)
+    # Human-readable and progress output always goes to stderr.
+    print(f"Validating {result.target_path}", file=sys.stderr)
+    print(f"Validation {result.status}: {result.target_path}", file=sys.stderr)
+    if result.message:
+        print(result.message, file=sys.stderr)
+    # Machine-readable Validation Result JSON always goes to stdout.
+    print(payload)
     return exit_code
