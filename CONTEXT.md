@@ -13,8 +13,24 @@ The first Saringan validation layer: a local, non-LLM gate made of repeatable st
 _Avoid_: Static checks script, Layer 1 script
 
 **Contextual Judge Gate**:
-The future Saringan validation layer that evaluates code changes against issue context and project conventions using LLM-based judgement.
+The Saringan validation layer that evaluates code changes against issue context and project conventions using LLM-based judgement. It is implemented as the `saringan judge` CLI subcommand, using a LiteLLM-powered client that calls an LLM with a structured JSON schema response format. The judge produces a summary, advisories, and acceptance criteria verdicts.
 _Avoid_: Layer 2 in v1, deterministic check
+
+**Scope Guard**:
+A companion LLM check that runs before the Contextual Judge Gate. It evaluates whether the changed files in a diff stay within the intended scope of the issue specification, returning a `yes`/`no`/`idk` verdict with rationale.
+_Avoid_: Scope validator, scope filter
+
+**Acceptance Criteria Evaluation**:
+The per-criterion verdicts produced by the Contextual Judge Gate. Each criterion extracted from the issue is evaluated against the diff as `yes`, `no`, or `idk` (unable to determine), with a supporting rationale.
+_Avoid_: Arbitrary pass/fail, unbounded review
+
+**Completion Score**:
+A deterministic score computed from Acceptance Criteria verdicts: `yes_count / (yes_count + no_count)`. Criteria with `idk` verdict are excluded from both the numerator and denominator. An empty or all-`idk` list yields `0.0`.
+_Avoid_: LLM-judged score, subjective metric
+
+**Judge Advisories**:
+Structured findings returned by the Contextual Judge Gate, including auto-detected debug artifacts (`print(`, `console.log(`) in the diff. Each advisory includes a kind, file, line number, and snippet.
+_Avoid_: Free-form warnings, inline comments
 
 **Rangkai Integration**:
 The optional use of Saringan by the Rangkai orchestrator as a post-implementation validation step. Rangkai invokes Saringan and reacts to its result, but does not define Saringan's checks.
