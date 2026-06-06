@@ -737,26 +737,51 @@ def validate_target(
     return result, exit_code
 
 
+class HarnessExecutionError(Exception):
+    """Raised when a judge harness execution fails.
+
+    Carries diagnostic evidence from the failed harness run so that
+    callers can include it in Check Evidence.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        exit_code: int | None = None,
+        result_path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+        self.result_path = result_path
+
+
 def execute_judge_harness(
     harness_command: str,
     request: JudgeRequest,
     judge_input: JudgeInput,
     result_path: Path,
     provider: str | None = None,
-) -> tuple[dict[str, object], dict[str, object] | None]:
+    timeout: int | None = None,
+) -> tuple[dict[str, object], dict[str, object] | None, str, str, int]:
     """Execute a judge harness command with the given context.
 
     Returns:
-        (harness_input, result_artifact_dict) on success.
-        The result_artifact_dict is the raw JSON object written by the harness.
+        (harness_input, result_artifact_dict, stdout, stderr, exit_code)
+        on success.  The result_artifact_dict is the raw JSON object written
+        by the harness.
 
     Raises:
-        subprocess.CalledProcessError-like exception on harness failures.
         OSError if the harness command cannot be started.
-        json.JSONDecodeError if the harness writes invalid JSON.
-        HarnessValidationError if the artifact is invalid.
+        HarnessExecutionError if the harness exits non-zero, does not write
+            a result artifact, writes invalid JSON, or fails schema validation.
     """
-    from saringan.judge_harness import validate_harness_result
+    from saringan.judge_harness import HarnessValidationError, validate_harness_result
 
     harness_args = shlex.split(harness_command)
     if not harness_args:
@@ -777,39 +802,70 @@ def execute_judge_harness(
     env["SARINGAN_RESULT_PATH"] = str(result_path)
     env.pop("VIRTUAL_ENV", None)
 
-    completed = subprocess.run(
-        harness_args,
-        input=harness_input_json,
-        capture_output=True,
-        text=True,
-        cwd=request.target_path,
-        env=env,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            harness_args,
+            input=harness_input_json,
+            capture_output=True,
+            text=True,
+            cwd=request.target_path,
+            env=env,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise HarnessExecutionError(
+            f"Judge harness timed out after {timeout} seconds",
+            stdout=error.stdout.decode() if error.stdout else "",
+            stderr=error.stderr.decode() if error.stderr else "",
+            exit_code=None,
+            result_path=str(result_path) if result_path.exists() else None,
+        ) from error
+
+    harness_stdout = completed.stdout
+    harness_stderr = completed.stderr
+    harness_exit_code = completed.returncode
 
     if completed.returncode != 0:
-        harness_stderr = completed.stderr.strip()
-        detail = f" (stderr: {harness_stderr})" if harness_stderr else ""
-        raise RuntimeError(
-            f"Judge harness exited with code {completed.returncode}{detail}"
+        raise HarnessExecutionError(
+            f"Judge harness exited with code {completed.returncode}",
+            stdout=harness_stdout,
+            stderr=harness_stderr,
+            exit_code=harness_exit_code,
+            result_path=str(result_path) if result_path.exists() else None,
         )
 
     if not result_path.exists():
-        raise FileNotFoundError(
-            "Judge harness did not write result artifact"
+        raise HarnessExecutionError(
+            "Judge harness did not write result artifact",
+            stdout=harness_stdout,
+            stderr=harness_stderr,
+            exit_code=harness_exit_code,
+            result_path=None,
         )
 
     try:
         raw_artifact = json.loads(result_path.read_text())
     except json.JSONDecodeError as error:
-        raise json.JSONDecodeError(
+        raise HarnessExecutionError(
             f"Judge harness wrote invalid JSON result artifact: {error}",
-            error.doc,
-            error.pos,
+            stdout=harness_stdout,
+            stderr=harness_stderr,
+            exit_code=harness_exit_code,
+            result_path=str(result_path),
         ) from error
 
     # Validate against the Judge Harness Protocol Contract
-    validated = validate_harness_result(raw_artifact)
+    try:
+        validated = validate_harness_result(raw_artifact)
+    except HarnessValidationError as error:
+        raise HarnessExecutionError(
+            str(error),
+            stdout=harness_stdout,
+            stderr=harness_stderr,
+            exit_code=harness_exit_code,
+            result_path=str(result_path),
+        ) from error
     artifact_dict: dict[str, object] = {
         "summary": validated.summary,
         "scope_guard": {
@@ -826,7 +882,7 @@ def execute_judge_harness(
         ],
     }
 
-    return harness_input, artifact_dict
+    return harness_input, artifact_dict, harness_stdout, harness_stderr, harness_exit_code
 
 
 def judge_target(
@@ -836,6 +892,7 @@ def judge_target(
     harness_command: str | None = None,
     harness_provider: str | None = None,
     harness_name: str | None = None,
+    harness_timeout: int | None = None,
     use_legacy_adapter: bool = False,
     legacy_provider: str | None = None,
 ) -> tuple[ValidationResult, int]:
@@ -956,28 +1013,83 @@ def judge_target(
 
     # ── Harness execution path ──────────────────────────────────────────────
     if harness_command is not None:
-        from saringan.judge_harness import HarnessValidationError
-
         harness_result_dir = tempfile.mkdtemp(prefix="saringan-harness-")
         harness_result_path = Path(harness_result_dir) / "result.json"
         try:
-            harness_input_data, harness_artifact = execute_judge_harness(
+            harness_input_data, harness_artifact, harness_stdout, harness_stderr, harness_exit_code = execute_judge_harness(
                 harness_command,
                 request,
                 judge_input,
                 harness_result_path,
                 provider=harness_provider,
+                timeout=harness_timeout,
             )
-        except (OSError, FileNotFoundError, json.JSONDecodeError, HarnessValidationError, RuntimeError) as error:
+        except HarnessExecutionError as error:
             finished_at = iso_now()
+            error_evidence: dict[str, object] = {
+                "target_path": resolved_target_path,
+                "diff_path": str(request.diff_path.resolve()),
+                "issue_path": str(request.issue_path.resolve()),
+                "conventions_path": (
+                    str(request.conventions_path.resolve())
+                    if request.conventions_path is not None
+                    else None
+                ),
+                "model": request.model,
+                "harness_command": harness_command,
+                "harness_name": harness_name,
+                "provider": harness_provider,
+                "changed_files": changed_files,
+                "harness_stdout": bound_output(error.stdout),
+                "harness_stderr": bound_output(error.stderr),
+                "harness_exit_code": error.exit_code,
+            }
+            if error.result_path is not None:
+                error_evidence["result_artifact_path"] = error.result_path
             return (
                 ValidationResult(
                     status="error",
+                    check_outcomes=[
+                        {
+                            "id": "contextual_judge",
+                            "stable_check_id": "contextual_judge",
+                            "status": "error",
+                            "blocking": False,
+                            "message": error.message,
+                            "evidence": error_evidence,
+                        }
+                    ],
                     target_path=resolved_target_path,
                     config_path=None,
                     started_at=started_at,
                     finished_at=finished_at,
-                    message=str(error),
+                ),
+                EXIT_ERROR,
+            )
+        except OSError as error:
+            finished_at = iso_now()
+            return (
+                ValidationResult(
+                    status="error",
+                    check_outcomes=[
+                        {
+                            "id": "contextual_judge",
+                            "stable_check_id": "contextual_judge",
+                            "status": "error",
+                            "blocking": False,
+                            "message": str(error),
+                            "evidence": {
+                                "target_path": resolved_target_path,
+                                "harness_command": harness_command,
+                                "harness_name": harness_name,
+                                "provider": harness_provider,
+                            },
+                        }
+                    ],
+                    target_path=resolved_target_path,
+                    config_path=None,
+                    started_at=started_at,
+                    finished_at=finished_at,
                 ),
                 EXIT_ERROR,
             )
@@ -1019,6 +1131,10 @@ def judge_target(
                             "advisories": advisories,
                             "acceptance_criteria": acceptance_criteria,
                             "completion_score": completion_score,
+                            "harness_stdout": bound_output(harness_stdout),
+                            "harness_stderr": bound_output(harness_stderr),
+                            "harness_exit_code": harness_exit_code,
+                            "result_artifact_path": str(harness_result_path.resolve()),
                             "input": {
                                 "diff_text": bound_output(judge_input.diff_text),
                                 "issue_text": bound_output(judge_input.issue_text),
@@ -1254,6 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
         resolved_harness_name: str | None = None
         resolved_provider: str | None = provider_override
         resolved_model: str = model_override or "gpt-5"
+        resolved_timeout: int | None = None
 
         if harness_arg is not None and judge_config is not None:
             # Try named harness lookup
@@ -1274,6 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolved_harness_name = harness_arg
                 resolved_provider = provider
                 resolved_model = model
+                resolved_timeout = timeout
             except HarnessNotFoundError as error:
                 finished_at = iso_now()
                 result = ValidationResult(
@@ -1310,6 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolved_harness_name = judge_config.default_harness
                 resolved_provider = provider
                 resolved_model = model
+                resolved_timeout = timeout
             except HarnessNotFoundError as error:
                 finished_at = iso_now()
                 result = ValidationResult(
@@ -1340,6 +1459,7 @@ def main(argv: list[str] | None = None) -> int:
             harness_command=resolved_harness_command,
             harness_provider=resolved_provider,
             harness_name=resolved_harness_name,
+            harness_timeout=resolved_timeout,
         )
         print(f"Judging {result.target_path}", file=sys.stderr)
         print(f"Judge {result.status}: {result.target_path}", file=sys.stderr)
