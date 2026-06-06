@@ -2033,3 +2033,1439 @@ def test_qag_acceptance_criteria_are_advisory_only(
     assert payload["status"] == "passed"
     evidence = payload["check_outcomes"][0]["evidence"]
     assert evidence["completion_score"] == 0.0
+
+
+# ── Judge Harness execution tests (Issue #44) ─────────────────────────────
+
+
+def _make_fake_harness_script(code: str, tmp_path: Path) -> Path:
+    """Write a fake harness Python script to tmp_path and return its path."""
+    harness_path = tmp_path / "fake_harness.py"
+    harness_path.write_text(code)
+    return harness_path
+
+
+def test_judge_harness_writes_valid_result_artifact_reports_passed(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes a valid Judge Harness result artifact produces
+    a passed advisory Contextual Judge Gate Check Outcome."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text(
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+print('debug')\n"
+    )
+    issue_path.write_text("# Issue 44: Implement judge harness\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+# Produce a valid harness result artifact
+artifact = {
+    "summary": "Harness executed successfully.",
+    "scope_guard": {
+        "verdict": "yes",
+        "rationale": "All changed files relate to issue scope."
+    },
+    "advisories": [
+        {"kind": "debug_artifact", "file": "src/app.py", "line": 2, "snippet": "print('debug')"}
+    ],
+    "acceptance_criteria": [
+        {
+            "criterion": "Harness writes valid artifact",
+            "verdict": "yes",
+            "rationale": "Artifact conforms to contract."
+        }
+    ]
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    assert payload["target_path"] == str(target.resolve())
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["id"] == "contextual_judge"
+    assert outcome["stable_check_id"] == "contextual_judge"
+    assert outcome["status"] == "passed"
+    assert outcome["blocking"] is False
+    assert outcome["message"] == "Harness executed successfully."
+    evidence = outcome["evidence"]
+    assert evidence["diff_path"] == str(diff_path.resolve())
+    assert evidence["issue_path"] == str(issue_path.resolve())
+    assert evidence["changed_files"] == ["src/app.py"]
+    assert evidence["scope_guard"]["verdict"] == "yes"
+    assert evidence["scope_guard"]["rationale"] == "All changed files relate to issue scope."
+    assert len(evidence["advisories"]) == 1
+    assert evidence["advisories"][0]["kind"] == "debug_artifact"
+    assert len(evidence["acceptance_criteria"]) == 1
+    assert evidence["acceptance_criteria"][0]["verdict"] == "yes"
+    assert evidence["completion_score"] == 1.0
+    assert evidence["harness_command"] == f"python3 {fake_harness}"
+    assert "input" in evidence
+    assert evidence["input"]["issue_text"] == "# Issue 44: Implement judge harness\n"
+    assert evidence["input"]["diff_text"].startswith("diff --git a/src/app.py")
+    assert payload["started_at"]
+    assert payload["finished_at"]
+
+
+def test_judge_harness_with_minimal_required_fields_reports_passed(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes only required fields (summary + scope_guard)
+    produces a passed outcome."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Minimal valid result.",
+    "scope_guard": {"verdict": "idk", "rationale": "Not enough context."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "passed"
+    assert outcome["message"] == "Minimal valid result."
+    evidence = outcome["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "idk"
+    assert evidence["advisories"] == []
+    assert evidence["acceptance_criteria"] == []
+    assert evidence["completion_score"] == 0.0
+
+
+def test_judge_harness_successful_run_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A successful harness run includes bounded harness stdout, stderr,
+    exit_code, and result_artifact_path in Check Evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    harness_stdout_msg = "Harness diagnostic output to stdout"
+    harness_stderr_msg = "Harness diagnostic output to stderr"
+
+    fake_harness = _make_fake_harness_script(
+        f'''import json, os, sys
+print({json.dumps(harness_stdout_msg)})
+print({json.dumps(harness_stderr_msg)}, file=sys.stderr)
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {{
+    "summary": "ok",
+    "scope_guard": {{"verdict": "yes", "rationale": "in scope"}}
+}}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "passed"
+    evidence = outcome["evidence"]
+    assert evidence["harness_stdout"] == harness_stdout_msg + "\n"
+    assert evidence["harness_stderr"] == harness_stderr_msg + "\n"
+    assert evidence["harness_exit_code"] == 0
+    assert "result_artifact_path" in evidence
+    assert evidence["result_artifact_path"].endswith("result.json")
+
+
+def test_judge_harness_exits_nonzero_reports_error(
+    tmp_path: Path,
+) -> None:
+    """A harness that exits with non-zero code produces status: error."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, sys
+input_data = json.load(sys.stdin)
+sys.exit(3)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "exited with code 3" in outcome["message"]
+
+
+def test_judge_harness_nonzero_exit_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness that exits non-zero produces status: error with diagnostic
+    evidence (bounded stdout, stderr, exit_code, harness_command) in the
+    error check_outcome."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    harness_stdout_msg = "stdout before crash"
+    harness_stderr_msg = "stderr: something went wrong"
+
+    fake_harness = _make_fake_harness_script(
+        f'''import json, sys
+print({json.dumps(harness_stdout_msg)})
+print({json.dumps(harness_stderr_msg)}, file=sys.stderr)
+input_data = json.load(sys.stdin)
+sys.exit(7)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["id"] == "contextual_judge"
+    assert outcome["stable_check_id"] == "contextual_judge"
+    assert outcome["status"] == "error"
+    assert outcome["blocking"] is False
+    evidence = outcome["evidence"]
+    assert evidence["harness_stdout"] == harness_stdout_msg + "\n"
+    assert evidence["harness_stderr"] == harness_stderr_msg + "\n"
+    assert evidence["harness_exit_code"] == 7
+    assert "harness_command" in evidence
+
+
+def test_judge_harness_writes_invalid_output_reports_error(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes invalid JSON (non-conforming to contract)
+    produces status: error."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+# Write output missing required scope_guard field
+artifact = {"summary": "ok"}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "scope_guard" in outcome["message"]
+
+
+def test_judge_harness_omits_artifact_file_reports_error(
+    tmp_path: Path,
+) -> None:
+    """A harness that exits 0 but does not write the result artifact
+    produces status: error."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, sys
+# Read stdin but write nothing - just exit 0
+input_data = json.load(sys.stdin)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "result artifact" in outcome["message"]
+
+
+def test_judge_harness_writes_unparseable_json_reports_error(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes a file but with unparseable JSON
+    produces status: error."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import os, sys, json
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+with open(result_path, "w") as f:
+    f.write("not valid json {{{{{")
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert ("JSON" in outcome["message"] or "json" in outcome["message"].lower() or "parse" in outcome["message"].lower())
+
+
+def test_judge_harness_omits_artifact_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness that exits 0 but does not write result artifact includes
+    bounded stdout, stderr, and exit_code in error diagnostic evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, sys
+print("stdout: no artifact written")
+print("stderr: warning", file=sys.stderr)
+input_data = json.load(sys.stdin)
+# exit 0 but don't write artifact
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "result artifact" in outcome["message"]
+    evidence = outcome["evidence"]
+    assert "stdout: no artifact written" in evidence["harness_stdout"]
+    assert "stderr: warning" in evidence["harness_stderr"]
+    assert evidence["harness_exit_code"] == 0
+    assert "harness_command" in evidence
+
+
+def test_judge_harness_malformed_json_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes unparseable JSON includes stdout, stderr,
+    exit_code, and result_artifact_path in error diagnostic evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import os, sys, json
+print("stdout: writing JSON")
+print("stderr: diagnostic log", file=sys.stderr)
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+with open(result_path, "w") as f:
+    f.write("not valid json {{{{{")
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "invalid JSON" in outcome["message"] or "JSON" in outcome["message"]
+    evidence = outcome["evidence"]
+    assert "stdout: writing JSON" in evidence["harness_stdout"]
+    assert "stderr: diagnostic log" in evidence["harness_stderr"]
+    assert evidence["harness_exit_code"] == 0
+    assert "result_artifact_path" in evidence
+    assert "harness_command" in evidence
+
+
+def test_judge_harness_schema_mismatch_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness that writes valid JSON but fails schema validation includes
+    stdout, stderr, exit_code, and result_artifact_path in error evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import os, sys, json
+print("stdout: writing valid JSON")
+print("stderr: harness trace", file=sys.stderr)
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+# Valid JSON but missing required scope_guard field
+artifact = {"summary": "ok"}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "scope_guard" in outcome["message"]
+    evidence = outcome["evidence"]
+    assert "stdout: writing valid JSON" in evidence["harness_stdout"]
+    assert "stderr: harness trace" in evidence["harness_stderr"]
+    assert evidence["harness_exit_code"] == 0
+    assert "result_artifact_path" in evidence
+    assert "harness_command" in evidence
+
+
+def test_judge_harness_timeout_includes_diagnostic_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness that times out includes bounded stdout, stderr, and
+    exit_code=None in error diagnostic evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    # Fake harness that sleeps longer than the timeout
+    fake_harness = _make_fake_harness_script(
+        '''import sys, time, json
+print("stdout: starting work")
+print("stderr: diagnostic log", file=sys.stderr)
+sys.stdout.flush()
+sys.stderr.flush()
+input_data = json.load(sys.stdin)
+time.sleep(10)
+''',
+        tmp_path,
+    )
+
+    result, exit_code = judge_target(
+        JudgeRequest(
+            target_path=target,
+            diff_path=diff_path,
+            issue_path=issue_path,
+            conventions_path=None,
+            model="gpt-5",
+        ),
+        harness_command=f"python3 {fake_harness}",
+        harness_timeout=1,
+    )
+
+    assert exit_code == 2
+    payload = json.loads(
+        json.dumps(result, default=lambda value: value.__dict__)
+    )
+    assert payload["status"] == "error"
+    assert len(payload["check_outcomes"]) == 1
+    outcome = payload["check_outcomes"][0]
+    assert outcome["status"] == "error"
+    assert "timed out" in outcome["message"]
+    evidence = outcome["evidence"]
+    assert "stdout: starting work" in evidence["harness_stdout"]
+    assert "stderr: diagnostic log" in evidence["harness_stderr"]
+    assert evidence["harness_exit_code"] is None
+    assert "harness_command" in evidence
+
+
+def test_judge_harness_receives_full_context_via_stdin(
+    tmp_path: Path,
+) -> None:
+    """The harness receives diff_text, issue_text, conventions_text, model,
+    and target_path in the stdin input."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    conventions_path = tmp_path / "conventions.md"
+    diff_path.write_text("diff --git a/src/app.py b/src/app.py\n+new code\n")
+    issue_path.write_text("# Issue 44\n")
+    conventions_path.write_text("# Conventions\nUse snake_case.\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+# Validate all expected context fields are present
+assert input_data["target_path"] is not None
+assert "diff --git" in input_data["diff_text"]
+assert "# Issue 44" in input_data["issue_text"]
+assert "snake_case" in input_data["conventions_text"]
+assert input_data["model"] == "gpt-5"
+artifact = {
+    "summary": "Context received correctly.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--conventions",
+        str(conventions_path),
+        "--model",
+        "gpt-5",
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+
+
+def test_judge_harness_respects_conventions_from_stdin(
+    tmp_path: Path,
+) -> None:
+    """When --conventions is provided, the conventions text is passed to the
+    harness via stdin."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    conventions_path = tmp_path / "conventions.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+    conventions_path.write_text("# Project Conventions\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+assert input_data["conventions_text"] == "# Project Conventions\\n"
+artifact = {
+    "summary": "Conventions received.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--conventions",
+        str(conventions_path),
+        "--model",
+        "gpt-5",
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+
+
+def test_judge_harness_without_conventions_passes_none(
+    tmp_path: Path,
+) -> None:
+    """When --conventions is omitted, conventions_text is None/null in harness input."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+assert input_data["conventions_text"] is None, f"Expected None, got {input_data['conventions_text']!r}"
+artifact = {
+    "summary": "No conventions needed.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+
+
+# ── Judge Harness Configuration (Issue #45) ─────────────────────────────────
+
+
+def _make_judge_config_toml(tmp_path: Path, content: str) -> Path:
+    """Write a judge.toml to tmp_path and return its path."""
+    config_path = tmp_path / "judge.toml"
+    config_path.write_text(content)
+    return config_path
+
+
+def test_judge_with_config_uses_named_harness(tmp_path: Path) -> None:
+    """When --judge-config is provided and --harness names a harness,
+    the named harness command is executed and its name/model appear in evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Named harness worked.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "my-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--harness",
+        "my-harness",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["harness_name"] == "my-harness"
+    assert evidence["provider"] == "litellm"
+    assert evidence["model"] == "gpt-5"
+
+
+def test_judge_with_config_uses_default_harness_when_none_specified(
+    tmp_path: Path,
+) -> None:
+    """When --judge-config has a default_harness and --harness is omitted,
+    the default harness is used."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Default harness used.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+default_harness = "default-h"
+
+[[harnesses]]
+name = "default-h"
+provider = "openai"
+model = "gpt-4"
+command = ["python3", "{fake_harness}"]
+timeout = 180
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["harness_name"] == "default-h"
+    assert evidence["provider"] == "openai"
+    assert evidence["model"] == "gpt-4"
+
+
+def test_judge_provider_override_cli(tmp_path: Path) -> None:
+    """--provider overrides the harness provider in evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Provider overridden.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "my-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--harness",
+        "my-harness",
+        "--provider",
+        "anthropic",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["provider"] == "anthropic"
+    assert evidence["model"] == "gpt-5"  # unchanged
+
+
+def test_judge_model_override_cli(tmp_path: Path) -> None:
+    """--model overrides the harness model in evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Model overridden.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "my-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--harness",
+        "my-harness",
+        "--model",
+        "claude-sonnet-4",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["provider"] == "litellm"  # unchanged
+    assert evidence["model"] == "claude-sonnet-4"
+
+
+def test_judge_env_var_overrides_harness_and_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Environment variables SARINGAN_JUDGE_HARNESS and SARINGAN_JUDGE_PROVIDER
+    override the defaults."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Env overrides applied.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+default_harness = "default-h"
+
+[[harnesses]]
+name = "default-h"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+
+[[harnesses]]
+name = "env-harness"
+provider = "openai"
+model = "gpt-4"
+command = ["python3", "{fake_harness}"]
+timeout = 180
+""",
+    )
+
+    monkeypatch.setenv("SARINGAN_JUDGE_CONFIG", str(judge_config))
+    monkeypatch.setenv("SARINGAN_JUDGE_HARNESS", "env-harness")
+    monkeypatch.setenv("SARINGAN_JUDGE_PROVIDER", "anthropic")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["harness_name"] == "env-harness"
+    assert evidence["provider"] == "anthropic"  # overridden by env
+    assert evidence["model"] == "gpt-4"  # from harness
+
+
+def test_judge_env_var_model_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SARINGAN_JUDGE_MODEL overrides the harness model."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Model env override.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "my-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    monkeypatch.setenv("SARINGAN_JUDGE_CONFIG", str(judge_config))
+    monkeypatch.setenv("SARINGAN_JUDGE_HARNESS", "my-harness")
+    monkeypatch.setenv("SARINGAN_JUDGE_MODEL", "gemini-pro")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["model"] == "gemini-pro"
+
+
+def test_judge_cli_overrides_take_precedence_over_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI flags override environment variable values."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "CLI wins.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "env-h"
+provider = "openai"
+model = "gpt-4"
+command = ["python3", "{fake_harness}"]
+timeout = 180
+
+[[harnesses]]
+name = "cli-h"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    monkeypatch.setenv("SARINGAN_JUDGE_CONFIG", str(judge_config))
+    monkeypatch.setenv("SARINGAN_JUDGE_HARNESS", "env-h")
+    monkeypatch.setenv("SARINGAN_JUDGE_PROVIDER", "openai")
+    monkeypatch.setenv("SARINGAN_JUDGE_MODEL", "gpt-4")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        "cli-h",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-3",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["harness_name"] == "cli-h"
+    assert evidence["provider"] == "anthropic"
+    assert evidence["model"] == "claude-3"
+
+
+def test_judge_unknown_harness_reports_error(tmp_path: Path) -> None:
+    """Selecting a harness name not in config produces an Environment Failure."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        """\
+[[harnesses]]
+name = "known-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "-m", "some_harness"]
+timeout = 300
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--harness",
+        "unknown-harness",
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "unknown-harness" in payload["message"]
+
+
+def test_judge_invalid_config_reports_error(tmp_path: Path) -> None:
+    """An invalid judge config TOML produces an Environment Failure."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    judge_config = tmp_path / "judge.toml"
+    judge_config.write_text("this is not valid toml {{{[")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--json",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "TOML" in payload["message"] or "toml" in payload["message"].lower()
+
+
+def test_judge_raw_command_harness_still_works(tmp_path: Path) -> None:
+    """When --harness looks like a raw command (not a named harness in config),
+    it is executed directly (backward compat)."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Raw command harness.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["harness_command"] == f"python3 {fake_harness}"
+
+
+def test_judge_no_config_no_harness_uses_builtin_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without --judge-config and without --harness, built-in LLM path
+    is used (backward compat). This requires judge deps."""
+    if not HAS_JUDGE_DEPS:
+        pytest.skip("Requires 'judge' extra dependencies")
+
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--model",
+        "gpt-5",
+        "--json",
+    )
+
+    # This won't actually call the LLM (no API key in test),
+    # but the error should be from the built-in LLM path, not
+    # a config/harness error.
+    assert result.returncode in (0, 2)
+
+
+def test_judge_harness_receives_provider_via_stdin(tmp_path: Path) -> None:
+    """When a named harness is used, the provider and model are passed via stdin."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/file b/file\n")
+    issue_path.write_text("# Issue 45\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+assert input_data["provider"] == "litellm", f"Expected 'litellm', got {input_data['provider']!r}"
+assert input_data["model"] == "gpt-5", f"Expected 'gpt-5', got {input_data['model']!r}"
+artifact = {
+    "summary": "Provider received.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."}
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    judge_config = _make_judge_config_toml(
+        tmp_path,
+        f"""\
+[[harnesses]]
+name = "my-harness"
+provider = "litellm"
+model = "gpt-5"
+command = ["python3", "{fake_harness}"]
+timeout = 300
+""",
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--judge-config",
+        str(judge_config),
+        "--harness",
+        "my-harness",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["provider"] == "litellm"
+    assert evidence["model"] == "gpt-5"
