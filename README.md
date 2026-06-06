@@ -61,7 +61,7 @@ graph TD
 The first Saringan validation layer: a local, non-LLM gate made of repeatable static checks, tests, builds, and security scans executed directly within the agent's workspace or target directory.
 
 ### 2. Contextual Judge Gate
-The second Saringan validation layer: an advisory-first, LLM-based judgement gate that evaluates code changes against issue context, acceptance criteria, and project conventions (LLM-as-a-Judge). In this first implementation, the Contextual Judge Gate is advisory only and does **not** block merge eligibility—use `saringan validate` for the blocking Deterministic Gate.
+The second Saringan validation layer: an advisory-first, LLM-based judgement gate that evaluates code changes against issue context, acceptance criteria, and project conventions (LLM-as-a-Judge). The Contextual Judge Gate supports swappable **Judge Harnesses**—standalone processes that implement the [Judge Harness Protocol](docs/judge-harness-protocol.md)—as well as a built-in LiteLLM client and a legacy direct-model adapter. In this first implementation, the Contextual Judge Gate is advisory only and does **not** block merge eligibility—use `saringan validate` for the blocking Deterministic Gate.
 
 ### 3. Explicit & Declarative Configuration
 Saringan adheres to strict **Explicit Configuration**—it runs only from a declared `saringan.toml` config file and does not infer validation behavior from repository heuristics. Checks are defined via **Declarative Configuration** naming parameters, dependencies, and policies without using ad-hoc shell scripting.
@@ -138,8 +138,11 @@ Clone the repository and install in editable mode:
 Using `uv` (recommended):
 ```bash
 uv pip install -e .          # Deterministic Gate only
-uv pip install -e ".[judge]"  # With optional Contextual Judge Gate (litellm, pydantic)
+uv pip install -e ".[judge]"  # With built-in LLM client for Contextual Judge Gate (litellm, pydantic)
 ```
+
+> [!NOTE]
+> The `[judge]` extra is only required for the built-in LiteLLM direct-model path. Swappable Judge Harnesses (Pi headless, Codex headless, custom) do not require `litellm` or `pydantic`—they run as standalone subprocesses that communicate via the Judge Harness Protocol.
 
 Or using standard `pip`:
 ```bash
@@ -175,19 +178,28 @@ saringan validate <target_path> [--config <config_path>] [--log-dir <log_dir>]
 
 ### Contextual Judge Gate (`saringan judge`)
 
-Run the advisory Contextual Judge Gate against a diff and issue specification. The judge reads the diff, issue, and optional project conventions, then submits them to an LLM for structured evaluation including scope guard, code advisories, and acceptance-criteria verification.
+Run the advisory Contextual Judge Gate against a diff and issue specification. The judge reads the diff, issue, and optional project conventions. By default, it submits them through the built-in LLM client (LiteLLM). When a **Judge Harness** is configured, the evaluation is delegated to a standalone harness process—see [Judge Harness Protocol](docs/judge-harness-protocol.md) for details.
+
+The Contextual Judge Gate is not tied to any single model provider. It supports:
+- **Built-in LLM client** (LiteLLM, the default when no harness is configured)
+- **Swappable Judge Harnesses** (Pi headless, Codex headless, custom harnesses)
+- **Legacy direct-model adapter** (migration-safe LiteLLM path behind the harness contract)
 
 ```bash
-saringan judge <target_path> --diff <diff_path> --issue <issue_path> --model <model> [--conventions <conventions_path>]
+saringan judge <target_path> --diff <diff_path> --issue <issue_path> [--model <model>] [--conventions <conventions_path>] [--harness <name>] [--judge-config <path>] [--provider <name>] [--timeout <seconds>]
 ```
 
-| Argument / Option        | Required | Description |
-|--------------------------|----------|-------------|
-| `target_path`            | Yes      | Path to the repository directory (used for result metadata). |
-| `--diff <path>`          | Yes      | Path to a `diff` artifact (e.g., `git diff` output). File must exist. |
-| `--issue <path>`         | Yes      | Path to the issue/context artifact (e.g., issue markdown). File must exist. |
-| `--model <model>`        | Yes      | LLM model identifier (e.g., `openai/gpt-4o`). Recorded in the result payload. |
-| `--conventions <path>`   | No       | Optional project conventions artifact. If provided, the file must exist. |
+| Argument / Option         | Required | Description |
+|---------------------------|----------|-------------|
+| `target_path`             | Yes      | Path to the repository directory (used for result metadata). |
+| `--diff <path>`           | Yes      | Path to a `diff` artifact (e.g., `git diff` output). File must exist. |
+| `--issue <path>`          | Yes      | Path to the issue/context artifact (e.g., issue markdown). File must exist. |
+| `--model <model>`         | No       | LLM model identifier (e.g., `openai/gpt-4o`). Overrides the harness-defined model. Defaults to `gpt-5` when no harness is configured. Recorded in the result payload. |
+| `--conventions <path>`    | No       | Optional project conventions artifact. If provided, the file must exist. |
+| `--harness <name>`        | No       | Named harness to use from the judge configuration. If no judge config is provided, treated as a raw harness command (backward compatible). Also settable via `SARINGAN_JUDGE_HARNESS`. |
+| `--judge-config <path>`   | No       | Path to the judge harness configuration TOML file. Also settable via `SARINGAN_JUDGE_CONFIG`. |
+| `--provider <name>`       | No       | Override the harness-defined provider. Also settable via `SARINGAN_JUDGE_PROVIDER`. |
+| `--timeout <seconds>`     | No       | Override the harness-defined timeout in seconds. Also settable via `SARINGAN_JUDGE_TIMEOUT`. |
 
 ### Output Contract (stdout / stderr)
 
@@ -316,6 +328,43 @@ The Contextual Judge Gate returns a `passed` status with advisory evidence when 
 
 > [!IMPORTANT]
 > The `saringan judge` command is **advisory-first**. Exit code `0` means the judge completed successfully, not that the code is approved. The Contextual Judge Gate does **not** block merge eligibility in this first implementation. Use `saringan validate` for the blocking Deterministic Gate.
+
+## Judge Harness
+
+The Contextual Judge Gate supports swappable harness execution. Instead of calling a model directly, Saringan can delegate evaluation to a standalone harness process that reads judge context from stdin, writes a structured result artifact, and returns diagnostics on stdout/stderr.
+
+See [Judge Harness Protocol](docs/judge-harness-protocol.md) for the full protocol contract, configuration reference, CLI/env overrides, and Rangkai Integration guidance.
+
+### Quick Config Example
+
+```toml
+default_harness = "pi"
+
+[[harnesses]]
+name = "pi"
+provider = "anthropic"
+model = "claude-sonnet-4"
+command = ["python3", "-m", "pi_harness", "--provider", "{provider}", "--model", "{model}"]
+timeout = 300
+
+[[harnesses]]
+name = "codex-headless"
+provider = "openai"
+model = "gpt-5"
+command = ["node", "codex-runner.js", "--model", "{model}"]
+timeout = 600
+```
+
+Usage:
+```bash
+# Via CLI flags
+saringan judge . --diff changes.diff --issue issue.md --judge-config judge.toml --harness codex-headless
+
+# Via environment variables (for CI / Rangkai Integration)
+export SARINGAN_JUDGE_CONFIG=judge.toml
+export SARINGAN_JUDGE_HARNESS=codex-headless
+saringan judge . --diff changes.diff --issue issue.md
+```
 
 ---
 
