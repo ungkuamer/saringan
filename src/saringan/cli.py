@@ -6,8 +6,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 import os
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from typing import Protocol
@@ -454,6 +457,18 @@ def compute_completion_score(criteria: list[object]) -> float:
     return yes_count / len(decided)
 
 
+def compute_completion_score_from_raw(criteria: list[dict[str, object]]) -> float:
+    """Compute completion score from raw dict acceptance criteria (harness output)."""
+    if not criteria:
+        return 0.0
+    verdicts = [c.get("verdict") for c in criteria]
+    decided = [v for v in verdicts if v != "idk"]
+    if not decided:
+        return 0.0
+    yes_count = sum(1 for v in decided if v == "yes")
+    return yes_count / len(decided)
+
+
 def detect_debug_artifacts(diff_text: str) -> list[dict[str, object]]:
     advisories: list[dict[str, object]] = []
     current_file: str | None = None
@@ -722,10 +737,101 @@ def validate_target(
     return result, exit_code
 
 
+def execute_judge_harness(
+    harness_command: str,
+    request: JudgeRequest,
+    judge_input: JudgeInput,
+    result_path: Path,
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    """Execute a judge harness command with the given context.
+
+    Returns:
+        (harness_input, result_artifact_dict) on success.
+        The result_artifact_dict is the raw JSON object written by the harness.
+
+    Raises:
+        subprocess.CalledProcessError-like exception on harness failures.
+        OSError if the harness command cannot be started.
+        json.JSONDecodeError if the harness writes invalid JSON.
+        HarnessValidationError if the artifact is invalid.
+    """
+    from saringan.judge_harness import validate_harness_result
+
+    harness_args = shlex.split(harness_command)
+    if not harness_args:
+        raise OSError("Empty harness command")
+
+    harness_input: dict[str, object] = {
+        "target_path": str(request.target_path.resolve()),
+        "diff_text": judge_input.diff_text,
+        "issue_text": judge_input.issue_text,
+        "conventions_text": judge_input.conventions_text,
+        "model": request.model,
+    }
+
+    harness_input_json = json.dumps(harness_input)
+
+    env = os.environ.copy()
+    env["SARINGAN_RESULT_PATH"] = str(result_path)
+    env.pop("VIRTUAL_ENV", None)
+
+    completed = subprocess.run(
+        harness_args,
+        input=harness_input_json,
+        capture_output=True,
+        text=True,
+        cwd=request.target_path,
+        env=env,
+        check=False,
+    )
+
+    if completed.returncode != 0:
+        harness_stderr = completed.stderr.strip()
+        detail = f" (stderr: {harness_stderr})" if harness_stderr else ""
+        raise RuntimeError(
+            f"Judge harness exited with code {completed.returncode}{detail}"
+        )
+
+    if not result_path.exists():
+        raise FileNotFoundError(
+            "Judge harness did not write result artifact"
+        )
+
+    try:
+        raw_artifact = json.loads(result_path.read_text())
+    except json.JSONDecodeError as error:
+        raise json.JSONDecodeError(
+            f"Judge harness wrote invalid JSON result artifact: {error}",
+            error.doc,
+            error.pos,
+        ) from error
+
+    # Validate against the Judge Harness Protocol Contract
+    validated = validate_harness_result(raw_artifact)
+    artifact_dict: dict[str, object] = {
+        "summary": validated.summary,
+        "scope_guard": {
+            "verdict": validated.scope_guard.verdict,
+            "rationale": validated.scope_guard.rationale,
+        },
+        "advisories": [
+            {"kind": adv.kind, "file": adv.file, "line": adv.line, "snippet": adv.snippet}
+            for adv in validated.advisories
+        ],
+        "acceptance_criteria": [
+            {"criterion": c.criterion, "verdict": c.verdict, "rationale": c.rationale}
+            for c in validated.acceptance_criteria
+        ],
+    }
+
+    return harness_input, artifact_dict
+
+
 def judge_target(
     request: JudgeRequest,
     judge_client: JudgeClient | None = None,
     scope_guard_client: ScopeGuardClient | None = None,
+    harness_command: str | None = None,
 ) -> tuple[ValidationResult, int]:
     started_at = iso_now()
     resolved_target_path = str(request.target_path.resolve())
@@ -756,6 +862,90 @@ def judge_target(
 
     judge_input = read_judge_input(request)
     changed_files = extract_changed_files(judge_input.diff_text)
+
+    # ── Harness execution path ──────────────────────────────────────────────
+    if harness_command is not None:
+        from saringan.judge_harness import HarnessValidationError
+
+        harness_result_dir = tempfile.mkdtemp(prefix="saringan-harness-")
+        harness_result_path = Path(harness_result_dir) / "result.json"
+        try:
+            harness_input_data, harness_artifact = execute_judge_harness(
+                harness_command,
+                request,
+                judge_input,
+                harness_result_path,
+            )
+        except (OSError, FileNotFoundError, json.JSONDecodeError, HarnessValidationError, RuntimeError) as error:
+            finished_at = iso_now()
+            return (
+                ValidationResult(
+                    status="error",
+                    target_path=resolved_target_path,
+                    config_path=None,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    message=str(error),
+                ),
+                EXIT_ERROR,
+            )
+        finally:
+            shutil.rmtree(harness_result_dir, ignore_errors=True)
+
+        debug_advisories = detect_debug_artifacts(judge_input.diff_text)
+        scope_guard = harness_artifact["scope_guard"]
+        advisories = list(harness_artifact.get("advisories", []))
+        acceptance_criteria = list(harness_artifact.get("acceptance_criteria", []))
+        completion_score = compute_completion_score_from_raw(acceptance_criteria)
+
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="passed",
+                check_outcomes=[
+                    {
+                        "id": "contextual_judge",
+                        "stable_check_id": "contextual_judge",
+                        "status": "passed",
+                        "blocking": False,
+                        "message": harness_artifact["summary"],
+                        "evidence": {
+                            "target_path": resolved_target_path,
+                            "diff_path": str(request.diff_path.resolve()),
+                            "issue_path": str(request.issue_path.resolve()),
+                            "conventions_path": (
+                                str(request.conventions_path.resolve())
+                                if request.conventions_path is not None
+                                else None
+                            ),
+                            "model": request.model,
+                            "harness_command": harness_command,
+                            "changed_files": changed_files,
+                            "scope_guard": scope_guard,
+                            "advisories": advisories,
+                            "acceptance_criteria": acceptance_criteria,
+                            "completion_score": completion_score,
+                            "input": {
+                                "diff_text": bound_output(judge_input.diff_text),
+                                "issue_text": bound_output(judge_input.issue_text),
+                                "conventions_text": (
+                                    bound_output(judge_input.conventions_text)
+                                    if judge_input.conventions_text is not None
+                                    else None
+                                ),
+                            },
+                        },
+                    }
+                ],
+                target_path=resolved_target_path,
+                config_path=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            ),
+            EXIT_PASSED,
+        )
+
+    # ── Built-in LLM client path ────────────────────────────────────────────
 
     scope_guard_verdict: dict[str, str] | None = None
     try:
@@ -874,7 +1064,8 @@ def build_parser() -> argparse.ArgumentParser:
     judge_parser.add_argument("--diff", required=True, dest="diff_path")
     judge_parser.add_argument("--issue", required=True, dest="issue_path")
     judge_parser.add_argument("--conventions", dest="conventions_path")
-    judge_parser.add_argument("--model", required=True)
+    judge_parser.add_argument("--model", dest="model", default="gpt-5")
+    judge_parser.add_argument("--harness", dest="harness_command", default=None)
     judge_parser.add_argument("--json", action="store_true", dest="json_mode")
     return parser
 
@@ -894,16 +1085,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Validating {result.target_path}", file=sys.stderr)
         print(f"Validation {result.status}: {result.target_path}", file=sys.stderr)
     elif args.command == "judge":
+        request = JudgeRequest(
+            target_path=Path(args.target_path),
+            diff_path=Path(args.diff_path),
+            issue_path=Path(args.issue_path),
+            conventions_path=(
+                Path(args.conventions_path) if args.conventions_path else None
+            ),
+            model=args.model,
+        )
         result, exit_code = judge_target(
-            JudgeRequest(
-                target_path=Path(args.target_path),
-                diff_path=Path(args.diff_path),
-                issue_path=Path(args.issue_path),
-                conventions_path=(
-                    Path(args.conventions_path) if args.conventions_path else None
-                ),
-                model=args.model,
-            )
+            request,
+            harness_command=args.harness_command,
         )
         print(f"Judging {result.target_path}", file=sys.stderr)
         print(f"Judge {result.status}: {result.target_path}", file=sys.stderr)
