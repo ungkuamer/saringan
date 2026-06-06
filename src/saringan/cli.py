@@ -836,6 +836,8 @@ def judge_target(
     harness_command: str | None = None,
     harness_provider: str | None = None,
     harness_name: str | None = None,
+    use_legacy_adapter: bool = False,
+    legacy_provider: str | None = None,
 ) -> tuple[ValidationResult, int]:
     started_at = iso_now()
     resolved_target_path = str(request.target_path.resolve())
@@ -866,6 +868,91 @@ def judge_target(
 
     judge_input = read_judge_input(request)
     changed_files = extract_changed_files(judge_input.diff_text)
+
+    # ── Legacy adapter path ────────────────────────────────────────────────
+    if use_legacy_adapter:
+        from saringan.judge_harness import HarnessValidationError, validate_harness_result
+        from saringan.legacy_adapter import run_legacy_adapter
+
+        resolved_legacy_name = harness_name or "legacy-litellm"
+        resolved_legacy_provider = legacy_provider or harness_provider or "litellm"
+
+        try:
+            harness_artifact = run_legacy_adapter(
+                request,
+                judge_input,
+                judge_client=judge_client,
+                scope_guard_client=scope_guard_client,
+                changed_files=changed_files,
+            )
+            validated = validate_harness_result(harness_artifact)
+        except (JudgeDependencyError, JudgeStructuredOutputError, OSError, HarnessValidationError) as error:
+            finished_at = iso_now()
+            return (
+                ValidationResult(
+                    status="error",
+                    target_path=resolved_target_path,
+                    config_path=None,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    message=str(error),
+                ),
+                EXIT_ERROR,
+            )
+
+        debug_advisories = detect_debug_artifacts(judge_input.diff_text)
+        scope_guard_dict = harness_artifact["scope_guard"]
+        advisories = list(harness_artifact.get("advisories", []))
+        acceptance_criteria = list(harness_artifact.get("acceptance_criteria", []))
+        completion_score = compute_completion_score_from_raw(acceptance_criteria)
+
+        finished_at = iso_now()
+        return (
+            ValidationResult(
+                status="passed",
+                check_outcomes=[
+                    {
+                        "id": "contextual_judge",
+                        "stable_check_id": "contextual_judge",
+                        "status": "passed",
+                        "blocking": False,
+                        "message": validated.summary,
+                        "evidence": {
+                            "target_path": resolved_target_path,
+                            "diff_path": str(request.diff_path.resolve()),
+                            "issue_path": str(request.issue_path.resolve()),
+                            "conventions_path": (
+                                str(request.conventions_path.resolve())
+                                if request.conventions_path is not None
+                                else None
+                            ),
+                            "model": request.model,
+                            "harness_name": resolved_legacy_name,
+                            "provider": resolved_legacy_provider,
+                            "changed_files": changed_files,
+                            "scope_guard": scope_guard_dict,
+                            "advisories": advisories,
+                            "acceptance_criteria": acceptance_criteria,
+                            "completion_score": completion_score,
+                            "input": {
+                                "diff_text": bound_output(judge_input.diff_text),
+                                "issue_text": bound_output(judge_input.issue_text),
+                                "conventions_text": (
+                                    bound_output(judge_input.conventions_text)
+                                    if judge_input.conventions_text is not None
+                                    else None
+                                ),
+                            },
+                        },
+                    }
+                ],
+                target_path=resolved_target_path,
+                config_path=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            ),
+            EXIT_PASSED,
+        )
 
     # ── Harness execution path ──────────────────────────────────────────────
     if harness_command is not None:
