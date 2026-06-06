@@ -49,7 +49,6 @@ DEPRECATED_TYPE_ALIASES: dict[str, str] = {
 CHECK_FIELDS_BY_TYPE = {check_id: ALLOWED_EXECUTABLE_CHECK_FIELDS for check_id in STABLE_CHECK_IDS}
 SUPPORTED_CHECK_TYPES = set(CHECK_FIELDS_BY_TYPE) | set(DEPRECATED_TYPE_ALIASES)
 MAX_EVIDENCE_OUTPUT_LENGTH = 2000
-DEBUG_ARTIFACT_PATTERNS = ("print(", "console.log(")
 
 
 @dataclass
@@ -469,35 +468,6 @@ def compute_completion_score_from_raw(criteria: list[dict[str, object]]) -> floa
     return yes_count / len(decided)
 
 
-def detect_debug_artifacts(diff_text: str) -> list[dict[str, object]]:
-    advisories: list[dict[str, object]] = []
-    current_file: str | None = None
-    added_line_number = 0
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            current_file = None
-            added_line_number = 0
-            if len(parts) >= 4:
-                current_file = parts[3][2:] if parts[3].startswith("b/") else parts[3]
-            continue
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-
-        added_line_number += 1
-        snippet = line[1:]
-        if not any(pattern in snippet for pattern in DEBUG_ARTIFACT_PATTERNS):
-            continue
-        advisories.append(
-            {
-                "kind": "debug_artifact",
-                "file": current_file,
-                "line": added_line_number,
-                "snippet": bound_output(snippet),
-            }
-        )
-    return advisories
-
 
 def persist_check_log(
     log_dir: Path | None,
@@ -900,7 +870,6 @@ def judge_target(
                 EXIT_ERROR,
             )
 
-        debug_advisories = detect_debug_artifacts(judge_input.diff_text)
         scope_guard_dict = harness_artifact["scope_guard"]
         advisories = list(harness_artifact.get("advisories", []))
         acceptance_criteria = list(harness_artifact.get("acceptance_criteria", []))
@@ -984,7 +953,6 @@ def judge_target(
         finally:
             shutil.rmtree(harness_result_dir, ignore_errors=True)
 
-        debug_advisories = detect_debug_artifacts(judge_input.diff_text)
         scope_guard = harness_artifact["scope_guard"]
         advisories = list(harness_artifact.get("advisories", []))
         acceptance_criteria = list(harness_artifact.get("acceptance_criteria", []))

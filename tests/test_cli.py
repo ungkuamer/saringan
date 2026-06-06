@@ -3143,3 +3143,287 @@ timeout = 300
     evidence = payload["check_outcomes"][0]["evidence"]
     assert evidence["provider"] == "litellm"
     assert evidence["model"] == "gpt-5"
+
+
+# ── Issue #47: Consolidated harness result tests ───────────────────────────
+
+
+def test_harness_with_mixed_acceptance_criteria_excludes_idk_from_score(
+    tmp_path: Path,
+) -> None:
+    """A harness result with yes/no/idk verdicts computes completion score
+    excluding idk from the denominator (2 yes / 3 decided = 0.667)."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.py b/src/app.py\n+new feature\n")
+    issue_path.write_text("# Issue 47: Mix of criteria\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Mixed verdicts.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."},
+    "acceptance_criteria": [
+        {"criterion": "Criterion A", "verdict": "yes", "rationale": "Done."},
+        {"criterion": "Criterion B", "verdict": "yes", "rationale": "Done."},
+        {"criterion": "Criterion C", "verdict": "no", "rationale": "Missing."},
+        {"criterion": "Criterion D", "verdict": "idk", "rationale": "Unclear."},
+        {"criterion": "Criterion E", "verdict": "idk", "rationale": "Ambiguous."},
+    ]
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert len(evidence["acceptance_criteria"]) == 5
+    assert evidence["acceptance_criteria"][0]["verdict"] == "yes"
+    assert evidence["acceptance_criteria"][1]["verdict"] == "yes"
+    assert evidence["acceptance_criteria"][2]["verdict"] == "no"
+    assert evidence["acceptance_criteria"][3]["verdict"] == "idk"
+    assert evidence["acceptance_criteria"][4]["verdict"] == "idk"
+    # 2 yes / (2 yes + 1 no) = 0.666..., idk excluded
+    assert evidence["completion_score"] == pytest.approx(2 / 3)
+
+
+def test_harness_with_all_idk_criteria_yields_completion_score_zero(
+    tmp_path: Path,
+) -> None:
+    """A harness result where all acceptance criteria are idk returns
+    completion score 0.0 (no decided criteria)."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.py b/src/app.py\n+new feature\n")
+    issue_path.write_text("# Issue 47: All uncertain\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "All idk.",
+    "scope_guard": {"verdict": "yes", "rationale": "In scope."},
+    "acceptance_criteria": [
+        {"criterion": "Criterion A", "verdict": "idk", "rationale": "Unclear."},
+        {"criterion": "Criterion B", "verdict": "idk", "rationale": "Ambiguous."},
+    ]
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["completion_score"] == 0.0
+    assert len(evidence["acceptance_criteria"]) == 2
+    assert all(c["verdict"] == "idk" for c in evidence["acceptance_criteria"])
+
+
+def test_harness_with_no_scope_guard_verdict_in_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness result with scope guard verdict 'no' is included in
+    Check Evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/unrelated.c b/src/unrelated.c\n+code\n")
+    issue_path.write_text("# Issue 47: Add feature to app.py\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Out of scope.",
+    "scope_guard": {
+        "verdict": "no",
+        "rationale": "Changed file unrelated.c is outside issue scope."
+    }
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "no"
+    assert "unrelated.c" in evidence["scope_guard"]["rationale"]
+    assert evidence["changed_files"] == ["src/unrelated.c"]
+
+
+def test_harness_with_idk_scope_guard_verdict_in_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness result with scope guard verdict 'idk' is included in
+    Check Evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/config.toml b/config.toml\n+timeout=30\n")
+    issue_path.write_text("# Issue 47: Improve performance\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Scope uncertain.",
+    "scope_guard": {
+        "verdict": "idk",
+        "rationale": "Cannot determine if config change relates to performance."
+    }
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    evidence = payload["check_outcomes"][0]["evidence"]
+    assert evidence["scope_guard"]["verdict"] == "idk"
+    assert "config" in evidence["scope_guard"]["rationale"]
+    assert evidence["changed_files"] == ["config.toml"]
+
+
+def test_harness_with_mixed_criteria_includes_all_in_evidence(
+    tmp_path: Path,
+) -> None:
+    """A harness result with yes, no, and idk acceptance criteria plus
+    advisories includes all verdicts in Check Evidence."""
+    target = tmp_path / "target"
+    target.mkdir()
+    diff_path = tmp_path / "changes.diff"
+    issue_path = tmp_path / "issue.md"
+    diff_path.write_text("diff --git a/src/app.py b/src/app.py\n+new feature\n")
+    issue_path.write_text("# Issue 47: Full coverage\n")
+
+    fake_harness = _make_fake_harness_script(
+        '''import json, os, sys
+input_data = json.load(sys.stdin)
+result_path = os.environ["SARINGAN_RESULT_PATH"]
+artifact = {
+    "summary": "Full harness result.",
+    "scope_guard": {"verdict": "yes", "rationale": "Changes match issue scope."},
+    "advisories": [
+        {"kind": "style", "file": "src/app.py", "line": 10, "snippet": "use camelCase"}
+    ],
+    "acceptance_criteria": [
+        {"criterion": "Feature implemented", "verdict": "yes", "rationale": "Found implementation."},
+        {"criterion": "Tests added", "verdict": "no", "rationale": "No test changes."},
+        {"criterion": "Docs updated", "verdict": "idk", "rationale": "Cannot tell from diff."}
+    ]
+}
+with open(result_path, "w") as f:
+    json.dump(artifact, f)
+''',
+        tmp_path,
+    )
+
+    result = run_cli(
+        "judge",
+        str(target),
+        "--diff",
+        str(diff_path),
+        "--issue",
+        str(issue_path),
+        "--harness",
+        f"python3 {fake_harness}",
+        "--json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "passed"
+    outcome = payload["check_outcomes"][0]
+    assert outcome["message"] == "Full harness result."
+    evidence = outcome["evidence"]
+    # Scope guard present
+    assert evidence["scope_guard"]["verdict"] == "yes"
+    # Advisories present
+    assert len(evidence["advisories"]) == 1
+    assert evidence["advisories"][0]["kind"] == "style"
+    # Acceptance criteria with all three verdicts present
+    assert len(evidence["acceptance_criteria"]) == 3
+    verdicts = [c["verdict"] for c in evidence["acceptance_criteria"]]
+    assert "yes" in verdicts
+    assert "no" in verdicts
+    assert "idk" in verdicts
+    # Completion score: 1 yes / 2 decided = 0.5
+    assert evidence["completion_score"] == 0.5
+    # Changed files computed deterministically
+    assert evidence["changed_files"] == ["src/app.py"]
+    # Harness command present
+    assert evidence["harness_command"] == f"python3 {fake_harness}"
